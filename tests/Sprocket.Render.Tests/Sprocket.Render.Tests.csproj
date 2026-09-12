@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <!-- The CPU-effect stage tests (PLAN.md step 59) implement a test ICpuVideoEffect over raw native buffers. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The effect tests run real SkSL on an offscreen raster surface, so they need the native libSkiaSharp.
+         Pinned to 3.119.4 to match Sprocket.Render (ARCHITECTURE.md §14). The per-OS native asset packages
+         place the right runtimes/<rid>/native binary; the loader picks the one for the test host. -->
+    <PackageReference Include="SkiaSharp.NativeAssets.Win32" Version="3.119.4" />
+    <PackageReference Include="SkiaSharp.NativeAssets.Linux.NoDependencies" Version="3.119.4" />
+    <PackageReference Include="SkiaSharp.NativeAssets.macOS" Version="3.119.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Sprocket.Render\Sprocket.Render.csproj" />
+  </ItemGroup>
+
+</Project>

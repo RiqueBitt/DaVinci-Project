@@ -1,0 +1,648 @@
+using System.Collections.Concurrent;
+using System.Diagnostics.CodeAnalysis;
+using System.Runtime.InteropServices;
+using Sprocket.Core.Model;
+using Sprocket.Core.Timing;
+using Sprocket.Media.Native;
+
+namespace Sprocket.Media;
+
+/// <summary>
+/// What the decoder for one source resolved to (diagnostics, for the playback-stats overlay): the video codec
+/// and, when GPU decode is engaged, the hardware device backing it. Stable for the life of a decoder.
+/// </summary>
+/// <param name="CodecName">The video codec short name the decoder uses (e.g. <c>"h264"</c>, <c>"hevc"</c>).</param>
+/// <param name="HardwareDeviceName">The GPU device type powering decode (e.g. <c>"d3d11va"</c>, <c>"cuda"</c>),
+/// or <see langword="null"/> when decoding in software.</param>
+public readonly record struct VideoDecodeInfo(string CodecName, string? HardwareDeviceName)
+{
+    /// <summary>True when a hardware device is attached to the decoder (GPU decode); false for software decode.</summary>
+    public bool IsHardwareAccelerated => !string.IsNullOrEmpty(HardwareDeviceName);
+}
+
+/// <summary>
+/// Opens one source media file with the hand-rolled FFmpeg 8 binding, probes its streams, and decodes its
+/// video stream to native RGBA frames with frame-accurate seeking (ARCHITECTURE.md §11). This is the
+/// concrete backing for the timeline's source media; the playback layer wraps it in a ring buffer
+/// (<see cref="VideoDecodeRing"/>) and the render graph reaches it through the <c>IFrameSource</c> seam.
+/// </summary>
+/// <remarks>
+/// <para><b>Not thread-safe.</b> A <see cref="MediaSource"/> holds a single decoder and reusable packet/
+/// frame; all of <see cref="TryDecodeNextFrame"/> and <see cref="SeekTo"/> must run on one thread (the
+/// decode worker). The decoded pixels live in the pool's native buffers — never on the managed heap.</para>
+/// <para>Decode model (§11): <c>ReadFrame → SendPacket → ReceiveFrame</c>, draining the decoder before
+/// feeding the next packet, then a flush packet at end-of-input to emit buffered frames.</para>
+/// <para><b>Hardware decode</b> (<see cref="HardwareAccelMode.Auto"/>, the default): if the decoder has a
+/// hardware config for a platform-preferred device (§11) and the device opens, frames decode on the GPU and
+/// are downloaded to a CPU frame (<c>av_hwframe_transfer_data</c>) before the swscale → RGBA step. Any
+/// failure degrades to software decode, so callers always get RGBA frames regardless of hardware.</para>
+/// </remarks>
+public sealed unsafe class MediaSource : IDisposable
+{
+    // The desired GPU pixel format per decoder context, read by the static get_format callback (which can't
+    // capture state). Keyed by the AVCodecContext pointer; entries are removed on Dispose.
+    private static readonly ConcurrentDictionary<IntPtr, int> WantHwFormat = new();
+
+    private readonly FormatContextHandle _format;
+    private readonly CodecContextHandle _decoder;
+    private readonly SwsScaler _converter = new();
+    private readonly AvPacketHandle _packet = new();
+    private readonly AvFrameHandle _yuv = new();    // reusable decoder output (source/hw pixel format)
+    private readonly AvRational _videoTimeBase;
+    private readonly int _videoIndex;
+
+    private readonly IHardwareContext? _hwDevice;   // null when decoding in software
+    private readonly int _hwPixelFormat;            // the GPU frame format to expect when hw is active
+    private readonly AvFrameHandle? _hwTransfer;    // CPU frame the GPU frame is downloaded into
+
+    private bool _inputEof;     // ReadFrame returned no more packets
+    private bool _flushed;      // sent the end-of-stream flush packet to the decoder
+    private long _discardBeforePts = MediaTime.NoPts; // decode-to-target: skip frames before this (seek)
+    private bool _disposed;
+
+    private MediaSource(
+        FormatContextHandle format, CodecContextHandle decoder, int videoIndex, AvRational videoTimeBase,
+        ProbedMediaInfo info, IHardwareContext? hwDevice, int hwPixelFormat)
+    {
+        _format = format;
+        _decoder = decoder;
+        _videoIndex = videoIndex;
+        _videoTimeBase = videoTimeBase;
+        _hwDevice = hwDevice;
+        _hwPixelFormat = hwPixelFormat;
+        _hwTransfer = hwDevice is null ? null : new AvFrameHandle();
+        Info = info;
+    }
+
+    /// <summary>Streams/duration/format probed at open. Mirrors what is stored on the project's <see cref="MediaRef"/>.</summary>
+    public ProbedMediaInfo Info { get; }
+
+    /// <summary>Whether the source has a decodable video stream (always true for an opened <see cref="MediaSource"/>).</summary>
+    public bool HasVideo => Info.HasVideo;
+
+    /// <summary>The hardware device powering decode (e.g. <c>"d3d11va"</c>), or <c>null</c> when decoding in software.</summary>
+    public string? HardwareDeviceName => _hwDevice?.Name;
+
+    /// <summary>The video codec short name (e.g. <c>"h264"</c>) the decoder resolved to.</summary>
+    public string VideoDecoderName => _decoder.CodecName;
+
+    /// <summary>How this source's video decodes — codec + hardware device — for the diagnostics overlay.</summary>
+    public VideoDecodeInfo DecodeInfo => new(_decoder.CodecName, HardwareDeviceName);
+
+    /// <summary>
+    /// Opens and probes <paramref name="path"/>, opening its video decoder. Throws if the file cannot be
+    /// opened or has no decodable video stream (the slice is video-led; audio is probed but decoded by
+    /// <see cref="AudioSource"/>). <paramref name="hwAccel"/> selects GPU decode with software fallback.
+    /// </summary>
+    public static MediaSource Open(string path, HardwareAccelMode hwAccel = HardwareAccelMode.Auto) =>
+        Open(MediaOpenRequest.ForPath(path), hwAccel);
+
+    /// <summary>
+    /// Opens and probes <paramref name="request"/>, opening its video decoder. Same as
+    /// <see cref="Open(string, HardwareAccelMode)"/> but honouring an image-sequence <c>image2</c> open
+    /// (PLAN.md step 42) — the one entry point every decode call site routes through so a sequence decodes
+    /// exactly like an ordinary file downstream.
+    /// </summary>
+    public static MediaSource Open(MediaOpenRequest request, HardwareAccelMode hwAccel = HardwareAccelMode.Auto)
+    {
+        string path = request.Path;
+        ArgumentException.ThrowIfNullOrEmpty(path);
+
+        // Ensure any FFmpeg natives bundled beside the executable are loaded + the version is FFmpeg 8 before
+        // the first FFmpeg call (ARCHITECTURE.md §11); no-op on Windows / local dev once resolved.
+        FFmpegLoader.EnsureBundledNativesLoaded();
+
+        FormatContextHandle format = FormatContextHandle.OpenInput(path, request.InputFormatName, request.Options);
+        try
+        {
+            if (!format.TryFindBestStream(AvConst.MediaTypeVideo, out int videoIndex, out IntPtr videoStream, out IntPtr decoderCodec)
+                || decoderCodec == IntPtr.Zero)
+                throw new InvalidOperationException($"No video stream found in '{path}'.");
+
+            var st = (AvStream*)videoStream;
+            IntPtr codecpar = st->codecpar;
+            AvRational videoTimeBase = st->time_base;
+
+            // A user override (SPROCKET_HWACCEL=off) forces software decode as a safety valve for an unstable
+            // platform GPU decode stack (e.g. a VAAPI driver that segfaults natively — uncatchable managed-side).
+            // Only downgrades Auto→Disabled; an explicit Disabled from a caller (tests) is already software.
+            if (hwAccel == HardwareAccelMode.Auto && HardwareAccelSettings.ForceSoftware)
+                hwAccel = HardwareAccelMode.Disabled;
+
+            // Negotiate a hardware device + its decoder pixel format, then open the decoder. If hardware setup
+            // or open fails, tear it down and open a plain software decoder (the guaranteed fallback, §11).
+            IHardwareContext? hw = null;
+            int hwFmt = AvConst.PixFmtNone;
+            if (hwAccel == HardwareAccelMode.Auto)
+                (hw, hwFmt) = NegotiateHardware(decoderCodec);
+
+            CodecContextHandle decoder;
+            try
+            {
+                decoder = CreateDecoder(decoderCodec, codecpar, hw, hwFmt);
+            }
+            catch when (hw is not null)
+            {
+                hw.Dispose();
+                hw = null;
+                hwFmt = AvConst.PixFmtNone;
+                decoder = CreateDecoder(decoderCodec, codecpar, null, AvConst.PixFmtNone);
+            }
+
+            ProbedMediaInfo info = Probe(format, videoStream, decoder);
+            return new MediaSource(format, decoder, videoIndex, videoTimeBase, info, hw, hwFmt);
+        }
+        catch
+        {
+            format.Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Probes <paramref name="path"/> for stream facts without requiring a video stream: video-bearing files
+    /// are probed through the normal <see cref="Open"/> path (so dimensions come from the opened decoder, as
+    /// at playback); audio-only files (e.g. <c>.m4a</c> / <c>.mp3</c> / <c>.wav</c>) yield an audio-only
+    /// <see cref="ProbedMediaInfo"/> (<c>HasVideo = false</c>). Throws when the file has neither a decodable
+    /// video nor audio stream. This is the import-time probe (PLAN.md step 16b).
+    /// </summary>
+    public static ProbedMediaInfo ProbeInfo(string path) => ProbeInfo(MediaOpenRequest.ForPath(path));
+
+    /// <summary>
+    /// Probes <paramref name="request"/> for stream facts, honouring an image-sequence <c>image2</c> open
+    /// (PLAN.md step 42). Same contract as <see cref="ProbeInfo(string)"/>. For an image sequence the intrinsic
+    /// frame rate and total duration are the caller's chosen fps × frame count (the single source of truth); this
+    /// probe supplies the per-frame facts (dimensions, alpha, pixel format, codec).
+    /// </summary>
+    public static ProbedMediaInfo ProbeInfo(MediaOpenRequest request)
+    {
+        string path = request.Path;
+        ArgumentException.ThrowIfNullOrEmpty(path);
+        FFmpegLoader.EnsureBundledNativesLoaded();
+
+        using (FormatContextHandle format = FormatContextHandle.OpenInput(path, request.InputFormatName, request.Options))
+        {
+            bool hasVideo = format.TryFindBestStream(AvConst.MediaTypeVideo, out _, out _, out IntPtr videoDecoder)
+                && videoDecoder != IntPtr.Zero;
+            if (!hasVideo)
+                return ProbeAudioOnly(format, path);
+        }
+
+        using MediaSource source = Open(request);
+        return source.Info;
+    }
+
+    /// <summary>Builds the probe info for a source with no decodable video stream. Throws when it has no
+    /// decodable audio stream either (nothing Sprocket can use).</summary>
+    private static ProbedMediaInfo ProbeAudioOnly(FormatContextHandle format, string path)
+    {
+        if (!format.TryFindBestStream(AvConst.MediaTypeAudio, out _, out IntPtr audioStream, out IntPtr decoder)
+            || decoder == IntPtr.Zero)
+            throw new InvalidOperationException($"No decodable video or audio stream found in '{path}'.");
+
+        var st = (AvStream*)audioStream;
+        var par = (AvCodecParameters*)st->codecpar;
+        Timecode duration = format.Duration > 0
+            ? MediaTime.FromMicroseconds(format.Duration)          // AV_TIME_BASE (µs) container duration
+            : st->duration > 0
+                ? MediaTime.ToTimecode(st->duration, st->time_base)
+                : Timecode.Zero;
+
+        return new ProbedMediaInfo(
+            Duration: duration,
+            HasVideo: false,
+            FrameRate: Rational.Zero,
+            Width: 0,
+            Height: 0,
+            HasAudio: true,
+            SampleRate: par->sample_rate,
+            Channels: par->ch_layout.nb_channels,
+            AudioCodec: CodecName(par->codec_id));
+    }
+
+    /// <summary>Finds the first platform-preferred hardware device the decoder supports and that opens.</summary>
+    private static (IHardwareContext?, int) NegotiateHardware(IntPtr codec)
+    {
+        foreach (HardwareDeviceType type in HardwareDevice.PlatformPreferredTypes())
+        {
+            if (!TryFindHwConfig(codec, (int)type, out int pixFmt))
+                continue;
+            HardwareDevice? device = HardwareDevice.TryCreate(type);
+            if (device is not null)
+                return (device, pixFmt);
+        }
+        return (null, AvConst.PixFmtNone);
+    }
+
+    /// <summary>Scans the decoder's hardware configs for one that uses an attachable device context of the
+    /// given type, yielding the GPU pixel format frames will carry.</summary>
+    private static bool TryFindHwConfig(IntPtr codec, int type, out int pixFmt)
+    {
+        for (int i = 0; ; i++)
+        {
+            IntPtr cfg = LibAv.avcodec_get_hw_config(codec, i);
+            if (cfg == IntPtr.Zero)
+                break;
+            var config = (AvCodecHwConfig*)cfg;
+            if ((config->methods & AvConst.HwConfigMethodDeviceCtx) != 0 && config->device_type == type)
+            {
+                pixFmt = config->pix_fmt;
+                return true;
+            }
+        }
+        pixFmt = AvConst.PixFmtNone;
+        return false;
+    }
+
+    /// <summary>Creates and opens the video decoder, attaching the hardware device + a <c>get_format</c> that
+    /// selects the GPU pixel format when <paramref name="hw"/> is present.</summary>
+    private static CodecContextHandle CreateDecoder(IntPtr codec, IntPtr codecpar, IHardwareContext? hw, int hwFmt)
+    {
+        CodecContextHandle decoder = CodecContextHandle.Alloc(codec);
+        try
+        {
+            decoder.ApplyParameters(codecpar);
+
+            if (hw is not null)
+            {
+                WantHwFormat[decoder.Ptr] = hwFmt;
+                decoder.GetFormat = (IntPtr)(delegate* unmanaged<IntPtr, int*, int>)&PickFormat;
+                decoder.HwDeviceCtx = LibAv.av_buffer_ref(hw.DeviceContextRef);
+            }
+            else
+            {
+                // FFmpeg's default thread_count is 1, so a software decoder left alone runs single-threaded and
+                // wastes every core but one on the CPU fallback path — exactly where the headroom is needed.
+                // 0 = auto (libavcodec sizes the pool from the CPU count). Software-path only: hardware decode runs
+                // on fixed-function silicon that gains nothing from worker threads, and frame threading would hand
+                // get_format per-thread context copies whose pointers miss the WantHwFormat entry keyed above —
+                // silently downgrading the GPU path to software.
+                decoder.ThreadCount = 0;
+            }
+
+            decoder.Open(codec);
+            return decoder;
+        }
+        catch
+        {
+            WantHwFormat.TryRemove(decoder.Ptr, out _);
+            decoder.Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>The decoder's <c>get_format</c> callback (unmanaged): pick the GPU format if offered, else the
+    /// first (software) format so decode still proceeds. Reads the wanted format from <see cref="WantHwFormat"/>.</summary>
+    [UnmanagedCallersOnly]
+    private static int PickFormat(IntPtr ctx, int* formats)
+    {
+        if (WantHwFormat.TryGetValue(ctx, out int want))
+            for (int* p = formats; *p != AvConst.PixFmtNone; p++)
+                if (*p == want)
+                    return want;
+        return *formats;
+    }
+
+    private static ProbedMediaInfo Probe(FormatContextHandle format, IntPtr videoStream, CodecContextHandle decoder)
+    {
+        var st = (AvStream*)videoStream;
+        var vpar = (AvCodecParameters*)st->codecpar;
+        Rational frameRate = ReadFrameRate(st);
+
+        // Read the source's pixel-format facts once from FFmpeg's static per-format descriptor (no frame decoded):
+        // alpha (drives premultiplied compositing, PLAN.md step 26) and component bit depth (media-bin info, §27).
+        int pixFmt = vpar->format;
+        (bool hasAlpha, int bitDepth, string chroma) = DescribePixelFormat(pixFmt);
+        string pixelFormatName = PixelFormatName(pixFmt);
+        // HDR transfer (PQ / HLG) and a VFR heuristic — informational for now (surfaced as media-bin badges, §27).
+        bool isHdr = vpar->color_trc is AvConst.ColorTrcSmpte2084 or AvConst.ColorTrcAribStdB67;
+        bool isVfr = IsVariableFrameRate(st);
+        string videoCodec = CodecName(vpar->codec_id);
+
+        // Color metadata + log-profile detection (PLAN.md steps 37, 52): record the codecpar color enums by
+        // their canonical names, then scan the container- and stream-level metadata tags for a known log
+        // profile (DJI, ARRI, Sony, Panasonic, Canon, Blackmagic, Fujifilm, Nikon) so the App can prepend the
+        // input color transform when the clip is placed.
+        string colorRange = ColorEnumName(LibAv.av_color_range_name(vpar->color_range));
+        string colorPrimaries = ColorEnumName(LibAv.av_color_primaries_name(vpar->color_primaries));
+        string colorTransfer = ColorEnumName(LibAv.av_color_transfer_name(vpar->color_trc));
+        string colorSpace = ColorEnumName(LibAv.av_color_space_name(vpar->color_space));
+        var metadata = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        CollectMetadata(format.Metadata, metadata);
+        CollectMetadata(st->metadata, metadata);
+        string detectedProfile = ColorProfiles.DetectLogProfile(metadata);
+
+        Timecode duration = format.Duration > 0
+            ? MediaTime.FromMicroseconds(format.Duration)          // AV_TIME_BASE (µs) container duration
+            : st->duration > 0
+                ? MediaTime.ToTimecode(st->duration, st->time_base)
+                : Timecode.Zero;
+
+        bool hasAudio = format.TryFindBestStream(AvConst.MediaTypeAudio, out _, out IntPtr audioStream, out _);
+        int sampleRate = 0, channels = 0;
+        string audioCodec = "";
+        if (hasAudio)
+        {
+            var audioPar = (AvCodecParameters*)((AvStream*)audioStream)->codecpar;
+            sampleRate = audioPar->sample_rate;
+            channels = audioPar->ch_layout.nb_channels;
+            audioCodec = CodecName(audioPar->codec_id);
+        }
+
+        return new ProbedMediaInfo(
+            Duration: duration,
+            HasVideo: true,
+            FrameRate: frameRate,
+            Width: decoder.Width,
+            Height: decoder.Height,
+            HasAudio: hasAudio,
+            SampleRate: sampleRate,
+            Channels: channels,
+            HasAlpha: hasAlpha,
+            VideoCodec: videoCodec,
+            AudioCodec: audioCodec,
+            PixelFormatName: pixelFormatName,
+            BitDepth: bitDepth,
+            IsHdr: isHdr,
+            IsVariableFrameRate: isVfr,
+            ColorRange: colorRange,
+            ColorPrimaries: colorPrimaries,
+            ColorTransfer: colorTransfer,
+            ColorSpace: colorSpace,
+            DetectedColorProfile: detectedProfile,
+            ChromaSubsampling: chroma);
+    }
+
+    /// <summary>Marshals an FFmpeg color-enum name, folding the "no declaration" names to <c>""</c> so the
+    /// probed fields read as absent rather than as FFmpeg's placeholder spellings.</summary>
+    private static string ColorEnumName(IntPtr name)
+    {
+        string s = Marshal.PtrToStringUTF8(name) ?? "";
+        return s is "unknown" or "unspecified" or "reserved" ? "" : s;
+    }
+
+    /// <summary>Copies every entry of an <c>AVDictionary</c> (container- or stream-level metadata) into
+    /// <paramref name="into"/> via the empty-key + <c>AV_DICT_IGNORE_SUFFIX</c> iteration idiom. Later
+    /// collections overwrite duplicate keys (stream tags win over container tags). Probe-time only.</summary>
+    private static void CollectMetadata(IntPtr dict, Dictionary<string, string> into)
+    {
+        if (dict == IntPtr.Zero)
+            return;
+        for (IntPtr e = LibAv.av_dict_get(dict, "", IntPtr.Zero, AvConst.DictIgnoreSuffix);
+             e != IntPtr.Zero;
+             e = LibAv.av_dict_get(dict, "", e, AvConst.DictIgnoreSuffix))
+        {
+            var entry = (AvDictionaryEntry*)e;
+            string? key = Marshal.PtrToStringUTF8(entry->key);
+            string? value = Marshal.PtrToStringUTF8(entry->value);
+            if (!string.IsNullOrEmpty(key) && value is not null)
+                into[key] = value;
+        }
+    }
+
+    /// <summary>Reads a pixel format's descriptor: whether it carries an alpha channel
+    /// (<c>AV_PIX_FMT_FLAG_ALPHA</c>), its per-component bit depth (8/10/12), and its chroma subsampling as a
+    /// canonical <c>"420"</c>/<c>"422"</c>/<c>"444"</c>-style string (see <see cref="ChromaSubsampling"/>).
+    /// Returns <c>(false, 8, "")</c> for <c>AV_PIX_FMT_NONE</c> / an unknown format. No frame is decoded.</summary>
+    private static (bool hasAlpha, int bitDepth, string chroma) DescribePixelFormat(int pixFmt)
+    {
+        if (pixFmt == AvConst.PixFmtNone)
+            return (false, 8, "");
+        IntPtr desc = LibAv.av_pix_fmt_desc_get(pixFmt);
+        if (desc == IntPtr.Zero)
+            return (false, 8, "");
+        var d = (AvPixFmtDescriptor*)desc;
+        bool hasAlpha = (d->flags & AvConst.PixFmtFlagAlpha) != 0;
+        int depth = d->comp0_depth > 0 ? d->comp0_depth : 8;
+        return (hasAlpha, depth, ChromaSubsampling(d, hasAlpha));
+    }
+
+    /// <summary>
+    /// A pixel format's chroma subsampling, read from the descriptor's <c>log2_chroma_w/h</c> rather than guessed
+    /// from its name: <c>"400"</c> (monochrome), <c>"420"</c>, <c>"422"</c>, <c>"440"</c>, <c>"411"</c>,
+    /// <c>"410"</c>, or <c>"444"</c> — the last covering RGB/GBR formats too, whose channels are all full-rate.
+    /// Consumers (the proxy policy, §17) need this because FFmpeg's format <em>names</em> do not reliably encode
+    /// it: <c>nv16</c> is 4:2:2 and <c>gbrp</c>/<c>rgb24</c> are full-chroma, yet none of them says so.
+    /// </summary>
+    private static string ChromaSubsampling(AvPixFmtDescriptor* d, bool hasAlpha)
+    {
+        // nb_components counts alpha; a single colour channel means there is no chroma at all.
+        int colorComponents = d->nb_components - (hasAlpha ? 1 : 0);
+        if (colorComponents <= 1)
+            return "400";
+
+        return (d->log2_chroma_w, d->log2_chroma_h) switch
+        {
+            (0, 0) => "444",
+            (1, 0) => "422",
+            (1, 1) => "420",
+            (0, 1) => "440",
+            (2, 0) => "411",
+            (2, 2) => "410",
+            _ => "",
+        };
+    }
+
+    /// <summary>The FFmpeg name of a pixel format (e.g. <c>"yuv422p10le"</c>), or <c>""</c> when unknown.</summary>
+    private static string PixelFormatName(int pixFmt)
+    {
+        if (pixFmt == AvConst.PixFmtNone)
+            return "";
+        return Marshal.PtrToStringUTF8(LibAv.av_get_pix_fmt_name(pixFmt)) ?? "";
+    }
+
+    /// <summary>The canonical short name of a codec id (e.g. <c>"h264"</c>); <c>""</c> if the id is unknown.</summary>
+    private static string CodecName(int codecId)
+    {
+        string name = Marshal.PtrToStringUTF8(LibAv.avcodec_get_name(codecId)) ?? "";
+        return name == "none" ? "" : name;
+    }
+
+    /// <summary>Heuristic: a source is variable-frame-rate when its average and base (real) frame rates disagree
+    /// meaningfully. Constant-rate sources report equal rates; VFR sources carry a high base-rate LCD that differs
+    /// from the true average. Informational only — decode is PTS-accurate either way.</summary>
+    private static bool IsVariableFrameRate(AvStream* st)
+    {
+        AvRational avg = st->avg_frame_rate, real = st->r_frame_rate;
+        if (avg.Num <= 0 || avg.Den <= 0 || real.Num <= 0 || real.Den <= 0)
+            return false;
+        double a = (double)avg.Num / avg.Den, b = (double)real.Num / real.Den;
+        if (a <= 0 || b <= 0)
+            return false;
+        return Math.Abs(a - b) / Math.Max(a, b) > 0.02;
+    }
+
+    /// <summary>Reads the video frame rate, preferring the average rate and falling back to the real base rate.</summary>
+    private static Rational ReadFrameRate(AvStream* videoStream)
+    {
+        AvRational avg = videoStream->avg_frame_rate;
+        if (avg.Num > 0 && avg.Den > 0)
+            return new Rational(avg.Num, avg.Den);
+
+        AvRational real = videoStream->r_frame_rate;
+        if (real.Num > 0 && real.Den > 0)
+            return new Rational(real.Num, real.Den);
+
+        return Rational.Zero;
+    }
+
+    /// <summary>
+    /// Decodes the next video frame in presentation order into a frame leased from <paramref name="pool"/>.
+    /// Returns false at end of stream. After <see cref="SeekTo"/>, frames before the seek target are decoded
+    /// and discarded (without an RGBA conversion) so the first returned frame lands at/just after the target.
+    /// </summary>
+    public bool TryDecodeNextFrame(VideoFramePool pool, [NotNullWhen(true)] out VideoFrame? frame)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ArgumentNullException.ThrowIfNull(pool);
+
+        while (TryReceiveYuv())
+        {
+            long pts = FramePts(_yuv);
+
+            // Decode-to-target: drop frames before the seek point. No swscale work for discarded frames.
+            if (_discardBeforePts != MediaTime.NoPts && pts != MediaTime.NoPts && pts < _discardBeforePts)
+                continue;
+            _discardBeforePts = MediaTime.NoPts;
+
+            if (!TryGetCpuFrame(out AvFrameHandle? source))
+                continue; // a failed GPU download — skip this frame rather than crash (§15)
+
+            VideoFrame rgba = pool.Rent();
+            _converter.Convert(source, rgba.Native);
+            rgba.Pts = pts == MediaTime.NoPts ? Timecode.Zero : MediaTime.ToTimecode(pts, _videoTimeBase);
+            // Carry the source's alpha flag onto the frame (probed once at open) so the compositor knows to take the
+            // premultiplied-alpha path for this layer rather than treating the RGBA buffer as opaque (PLAN.md step 26).
+            rgba.HasAlpha = Info.HasAlpha;
+            frame = rgba;
+            return true;
+        }
+
+        frame = null;
+        return false;
+    }
+
+    /// <summary>Returns the CPU-side frame to convert: the decoded frame directly in software, or the GPU
+    /// frame downloaded via <c>av_hwframe_transfer_data</c> when hardware decode produced a GPU frame.</summary>
+    private bool TryGetCpuFrame([NotNullWhen(true)] out AvFrameHandle? source)
+    {
+        if (_hwDevice is null || _yuv.Format != _hwPixelFormat)
+        {
+            source = _yuv; // software decode, or a per-frame software fallback the decoder chose
+            return true;
+        }
+
+        _hwTransfer!.Unref(); // let the transfer allocate fresh download buffers / choose the CPU format
+        if (LibAv.av_hwframe_transfer_data(_hwTransfer.Ptr, _yuv.Ptr, 0) < 0)
+        {
+            source = null;
+            return false;
+        }
+        source = _hwTransfer;
+        return true;
+    }
+
+    /// <summary>
+    /// Seeks so the next <see cref="TryDecodeNextFrame"/> returns the frame at/just after <paramref name="target"/>:
+    /// seek to the I-frame at or before the target, flush the decoder, then arm decode-to-target discard
+    /// (ARCHITECTURE.md §8 "seeking").
+    /// </summary>
+    public void SeekTo(Timecode target)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        long targetPts = MediaTime.ToStreamTimestamp(target, _videoTimeBase);
+
+        // AVSEEK_FLAG_BACKWARD: land on the I-frame at or before the target so the GOP decodes cleanly.
+        _format.SeekFrame(targetPts, _videoIndex, AvConst.SeekBackward);
+        _decoder.FlushBuffers();
+
+        _inputEof = false;
+        _flushed = false;
+        _discardBeforePts = targetPts;
+    }
+
+    /// <summary>Resets to the start of the stream (seek to time zero).</summary>
+    public void Rewind() => SeekTo(Timecode.Zero);
+
+    /// <summary>
+    /// Pulls one decoded frame into <see cref="_yuv"/>, feeding packets / a flush packet as the decoder
+    /// asks for more input. Returns false only at true end of stream.
+    /// </summary>
+    private bool TryReceiveYuv()
+    {
+        while (true)
+        {
+            switch (_decoder.ReceiveFrame(_yuv))
+            {
+                case CodecResult.Success:
+                    return true;
+                case CodecResult.Eof:
+                    return false;
+                case CodecResult.Again:
+                    if (!FeedDecoder())
+                        return false; // flush already sent and decoder still hungry → nothing left
+                    continue;
+                default:
+                    return false;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Feeds the decoder its next input: the next video packet, or — once input is exhausted — a single
+    /// flush (null) packet to drain buffered frames. Returns false when there is nothing left to feed.
+    /// </summary>
+    private bool FeedDecoder()
+    {
+        if (_inputEof)
+        {
+            if (_flushed)
+                return false;
+            _flushed = true;
+            _decoder.SendPacket(null); // enter draining mode: emit any frames still held by the decoder
+            return true;
+        }
+
+        while (_format.ReadFrame(_packet))
+        {
+            try
+            {
+                if (_packet.StreamIndex == _videoIndex)
+                {
+                    _decoder.SendPacket(_packet);
+                    return true;
+                }
+            }
+            finally
+            {
+                _packet.Unref();
+            }
+        }
+
+        // No more packets: switch to draining on the next call.
+        _inputEof = true;
+        return FeedDecoder();
+    }
+
+    /// <summary>The frame's presentation timestamp, preferring the best-effort estimate over the raw PTS.</summary>
+    private static long FramePts(AvFrameHandle frame) =>
+        frame.BestEffortTimestamp != MediaTime.NoPts ? frame.BestEffortTimestamp : frame.Pts;
+
+    /// <summary>Closes the decoder and source. Pooled frames are owned by the pool, not by the source.</summary>
+    public void Dispose()
+    {
+        if (_disposed)
+            return;
+        _disposed = true;
+
+        WantHwFormat.TryRemove(_decoder.Ptr, out _);
+        _packet.Dispose();
+        _yuv.Dispose();
+        _hwTransfer?.Dispose();
+        _converter.Dispose();
+        _decoder.Dispose();      // unrefs the decoder's hw_device_ctx ref
+        _hwDevice?.Dispose();    // unrefs our device-context ref
+        _format.Dispose();
+    }
+}

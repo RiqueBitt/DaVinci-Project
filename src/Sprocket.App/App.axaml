@@ -1,0 +1,292 @@
+<Application xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:app="clr-namespace:Sprocket.App"
+             x:Class="Sprocket.App.App"
+             Name="DaVinci Project"
+             RequestedThemeVariant="Dark">
+  <Application.Resources>
+    <!-- Palette (UI.md §1): near-black surfaces + a single indigo/violet accent. All values come from the
+         Palette class (Palette.cs) so the shell and the custom-drawn Skia surfaces share one source. -->
+    <SolidColorBrush x:Key="WindowBg" Color="{x:Static app:Palette.WindowBg}" />
+    <SolidColorBrush x:Key="PanelBg" Color="{x:Static app:Palette.PanelBg}" />
+    <SolidColorBrush x:Key="RaisedBg" Color="{x:Static app:Palette.RaisedBg}" />
+    <SolidColorBrush x:Key="Edge" Color="{x:Static app:Palette.Edge}" />
+    <SolidColorBrush x:Key="Text" Color="{x:Static app:Palette.Text}" />
+    <SolidColorBrush x:Key="MutedText" Color="{x:Static app:Palette.MutedText}" />
+    <SolidColorBrush x:Key="FaintText" Color="{x:Static app:Palette.FaintText}" />
+    <SolidColorBrush x:Key="Accent" Color="{x:Static app:Palette.Accent}" />
+    <SolidColorBrush x:Key="AccentHover" Color="{x:Static app:Palette.AccentHover}" />
+    <SolidColorBrush x:Key="Danger" Color="{x:Static app:Palette.Danger}" />
+
+    <!-- Semantic status (status-bar dot; playback-stats health). -->
+    <SolidColorBrush x:Key="Good" Color="{x:Static app:Palette.Good}" />
+    <SolidColorBrush x:Key="Warn" Color="{x:Static app:Palette.Warn}" />
+    <SolidColorBrush x:Key="Bad" Color="{x:Static app:Palette.Bad}" />
+
+    <!-- Compact Fluent control metrics (space-at-a-premium density): smaller radio bullets and slider
+         thumb than the Fluent defaults (20px). All RadioButtons in the shell are the tool/monitor palette. -->
+    <x:Double x:Key="RadioButtonMinHeight">22</x:Double>
+    <x:Double x:Key="SliderHorizontalHeight">26</x:Double>
+    <x:Double x:Key="SliderHorizontalThumbWidth">13</x:Double>
+    <x:Double x:Key="SliderHorizontalThumbHeight">13</x:Double>
+    <CornerRadius x:Key="SliderThumbCornerRadius">7</CornerRadius>
+    <!-- The Fluent template reserves 15px above/below the track for tick-bar placement regardless of
+         SliderHorizontalHeight — our scrubber never shows ticks (TickBar.IsVisible=False), so that space is
+         pure dead weight inflating the transport row. Star- (not fixed-) sized so the two rows split whatever
+         slack remains between the track and SliderHorizontalHeight equally, centering the track/thumb instead
+         of leaving it pinned to the top of the box. -->
+    <GridLength x:Key="SliderPreContentMargin">1*</GridLength>
+    <GridLength x:Key="SliderPostContentMargin">1*</GridLength>
+
+    <!-- The Inspector's collapsible sections (Clip / each effect) are Expanders; Fluent's defaults (48px
+         header min-height, 16px content padding) are sized for a full-width settings page, not a ~280px side
+         panel with 12px headers. Fluent's built-in chevron is not used at all: its Path is Stretch="None"
+         (confirmed against Avalonia's Expander.xaml), so no resource can shrink the drawn 14x7 arrow to match
+         the panel's 8px icon set — every section (Classes="inspectorSection", InspectorPanel.cs Section())
+         hides it via the scoped style below and draws its own Icons.cs chevron instead. -->
+    <x:Double x:Key="ExpanderMinHeight">28</x:Double>
+    <Thickness x:Key="ExpanderHeaderPadding">4,0,0,0</Thickness>
+    <Thickness x:Key="ExpanderContentPadding">0</Thickness>
+
+    <!-- Placeholder text must clear WCAG AA (≥4.5:1) on the dark input surface — Fluent's default is too dim. -->
+    <SolidColorBrush x:Key="TextControlPlaceholderForeground" Color="{x:Static app:Palette.FaintText}" />
+
+    <!-- Fluent's overlay scrollbar (ScrollBar.xaml) draws its thumb at ScrollBarSize (16px default) whenever
+         it is expanded (pointer-over or dragging); the collapsed sliver is that same thumb just scaled down
+         by a render transform, not a smaller control. Shrinking this one resource thins the hover/drag thumb
+         everywhere in the shell, matching the compact density of the other Fluent metric overrides above. -->
+    <x:Double x:Key="ScrollBarSize">8</x:Double>
+
+    <!-- Text sizes come from Typography.cs; these two keys are the *default* every templated Fluent
+         control reads. Fluent ships them at 14px, which is a step above the app's 11–12px chrome, so
+         any control that sets no FontSize (Button/ComboBox/CheckBox/ToggleButton/TextBox/MenuItem/
+         ListBoxItem, and every ToolTip) used to leak 14. Pinned to Typography.Body so un-sized controls
+         are Body by default and only departures need an explicit size. Bare TextBlocks already default
+         to 12 (Avalonia TextElement), so they need nothing. x:Double can't nest an {x:Static}, so these
+         are literals — keep them in lockstep with Typography.Body (same convention as the
+         SystemAccentColor literals below). -->
+    <x:Double x:Key="ControlContentThemeFontSize">12</x:Double>
+    <x:Double x:Key="ToolTipContentThemeFontSize">12</x:Double>
+
+    <!-- Popup surfaces (STYLE_GUIDE.md): every menu/flyout/dropdown/tooltip uses WindowBg + an Edge
+         border so popups match the hand-built dialog windows instead of Fluent's lighter ~#2C2C2C
+         defaults. Fluent has no ContextMenu-specific brush keys — ContextMenu, MenuFlyout, and the
+         menu-bar MenuItem dropdowns all consume the MenuFlyoutPresenter*/MenuFlyoutItem* keys below. -->
+    <SolidColorBrush x:Key="MenuFlyoutPresenterBackground" Color="{x:Static app:Palette.WindowBg}" />
+    <SolidColorBrush x:Key="MenuFlyoutPresenterBorderBrush" Color="{x:Static app:Palette.Edge}" />
+    <SolidColorBrush x:Key="MenuFlyoutItemForeground" Color="{x:Static app:Palette.Text}" />
+    <SolidColorBrush x:Key="MenuFlyoutItemForegroundDisabled" Color="{x:Static app:Palette.FaintText}" />
+    <SolidColorBrush x:Key="MenuFlyoutItemBackgroundPointerOver" Color="{x:Static app:Palette.Accent}" />
+    <SolidColorBrush x:Key="MenuFlyoutItemForegroundPointerOver" Color="White" />
+    <SolidColorBrush x:Key="MenuFlyoutItemBackgroundPressed" Color="{x:Static app:Palette.AccentHover}" />
+    <SolidColorBrush x:Key="MenuFlyoutItemForegroundPressed" Color="White" />
+    <SolidColorBrush x:Key="MenuFlyoutSubItemChevron" Color="{x:Static app:Palette.MutedText}" />
+    <SolidColorBrush x:Key="MenuFlyoutSubItemChevronPointerOver" Color="White" />
+    <SolidColorBrush x:Key="MenuFlyoutItemKeyboardAcceleratorTextForeground" Color="{x:Static app:Palette.MutedText}" />
+    <SolidColorBrush x:Key="MenuFlyoutItemKeyboardAcceleratorTextForegroundPointerOver" Color="White" />
+    <SolidColorBrush x:Key="MenuFlyoutItemKeyboardAcceleratorTextForegroundDisabled" Color="{x:Static app:Palette.FaintText}" />
+
+    <!-- Plain Flyout (the timeline Fit-zoom flyout). -->
+    <SolidColorBrush x:Key="FlyoutPresenterBackground" Color="{x:Static app:Palette.WindowBg}" />
+    <SolidColorBrush x:Key="FlyoutBorderThemeBrush" Color="{x:Static app:Palette.Edge}" />
+
+    <!-- ComboBox dropdowns (export/sequence/import dialogs, inspector, mixer). -->
+    <SolidColorBrush x:Key="ComboBoxDropDownBackground" Color="{x:Static app:Palette.WindowBg}" />
+    <SolidColorBrush x:Key="ComboBoxDropDownBorderBrush" Color="{x:Static app:Palette.Edge}" />
+    <SolidColorBrush x:Key="ComboBoxItemForeground" Color="{x:Static app:Palette.Text}" />
+    <SolidColorBrush x:Key="ComboBoxItemBackgroundPointerOver" Color="{x:Static app:Palette.Accent}" />
+    <SolidColorBrush x:Key="ComboBoxItemForegroundPointerOver" Color="White" />
+    <SolidColorBrush x:Key="ComboBoxItemBackgroundSelected" Color="{x:Static app:Palette.Accent}" />
+    <SolidColorBrush x:Key="ComboBoxItemForegroundSelected" Color="White" />
+    <SolidColorBrush x:Key="ComboBoxItemBackgroundSelectedPointerOver" Color="{x:Static app:Palette.AccentHover}" />
+    <SolidColorBrush x:Key="ComboBoxItemForegroundSelectedPointerOver" Color="White" />
+    <SolidColorBrush x:Key="ComboBoxItemBackgroundSelectedPressed" Color="{x:Static app:Palette.AccentHover}" />
+    <SolidColorBrush x:Key="ComboBoxItemForegroundSelectedPressed" Color="White" />
+
+    <!-- ToolTips. -->
+    <SolidColorBrush x:Key="ToolTipBackground" Color="{x:Static app:Palette.WindowBg}" />
+    <SolidColorBrush x:Key="ToolTipBorderBrush" Color="{x:Static app:Palette.Edge}" />
+    <SolidColorBrush x:Key="ToolTipForeground" Color="{x:Static app:Palette.Text}" />
+
+    <!-- FluentTheme seeds SystemAccentColor from the OS (Windows-blue on Windows), which leaks into
+         ComboBox selection, CheckBoxes, Slider fills, and text selection. Pin the whole ramp to the
+         Sprocket indigo so accent-tinted Fluent states match Palette.Accent everywhere. -->
+    <Color x:Key="SystemAccentColor">#66A1DD</Color>
+    <Color x:Key="SystemAccentColorDark1">#5590CC</Color>
+    <Color x:Key="SystemAccentColorDark2">#447FBB</Color>
+    <Color x:Key="SystemAccentColorDark3">#336EAA</Color>
+    <Color x:Key="SystemAccentColorLight1">#78AFE6</Color>
+    <Color x:Key="SystemAccentColorLight2">#89BCF0</Color>
+    <Color x:Key="SystemAccentColorLight3">#9AC8F7</Color>
+  </Application.Resources>
+
+  <Application.Styles>
+    <FluentTheme />
+
+    <!-- Shell styling (PLAN.md step 11 / UI.md §1): dark near-black panels, a single indigo accent. -->
+
+    <!-- Titled pane container. -->
+    <Style Selector="Border.pane">
+      <Setter Property="Background" Value="{DynamicResource PanelBg}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource Edge}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="6" />
+    </Style>
+
+    <!-- The active work area of the Tab / Shift+Tab focus ring (WorkAreaFocus, Shift+1–4 activate directly):
+         the pane that owns keyboard focus reads with an accent edge — the indigo the style guide reserves for
+         selection outlines. Declared after Border.pane so it wins the BorderBrush setter. -->
+    <Style Selector="Border.pane.activeArea">
+      <Setter Property="BorderBrush" Value="{DynamicResource Accent}" />
+    </Style>
+
+    <!-- Pane title strip. -->
+    <Style Selector="Border.paneHeader">
+      <Setter Property="Background" Value="{DynamicResource RaisedBg}" />
+      <Setter Property="Padding" Value="10,5" />
+      <Setter Property="BorderBrush" Value="{DynamicResource Edge}" />
+      <Setter Property="BorderThickness" Value="0,0,0,1" />
+      <Setter Property="CornerRadius" Value="5,5,0,0" />
+    </Style>
+    <Style Selector="TextBlock.title">
+      <Setter Property="Foreground" Value="{DynamicResource Text}" />
+      <Setter Property="FontSize" Value="{x:Static app:Typography.Body}" />
+      <Setter Property="FontWeight" Value="SemiBold" />
+      <Setter Property="VerticalAlignment" Value="Center" />
+    </Style>
+
+    <!-- Placeholder text for panes whose content lands in a later step. -->
+    <Style Selector="TextBlock.placeholder">
+      <Setter Property="Foreground" Value="{DynamicResource FaintText}" />
+      <Setter Property="FontSize" Value="{x:Static app:Typography.Body}" />
+      <Setter Property="HorizontalAlignment" Value="Center" />
+      <Setter Property="VerticalAlignment" Value="Center" />
+      <Setter Property="TextWrapping" Value="Wrap" />
+      <Setter Property="TextAlignment" Value="Center" />
+    </Style>
+
+    <!-- Window caption buttons (min / max / close). -->
+    <Style Selector="Button.caption">
+      <Setter Property="Width" Value="44" />
+      <Setter Property="Height" Value="34" />
+      <Setter Property="Padding" Value="0" />
+      <Setter Property="Background" Value="Transparent" />
+      <Setter Property="Foreground" Value="{DynamicResource MutedText}" />
+      <Setter Property="HorizontalContentAlignment" Value="Center" />
+      <Setter Property="VerticalContentAlignment" Value="Center" />
+      <Setter Property="CornerRadius" Value="0" />
+      <Setter Property="FontSize" Value="{x:Static app:Typography.Emphasis}" />
+    </Style>
+    <Style Selector="Button.caption:pointerover /template/ ContentPresenter">
+      <Setter Property="Background" Value="{DynamicResource RaisedBg}" />
+      <Setter Property="Foreground" Value="{DynamicResource Text}" />
+    </Style>
+    <Style Selector="Button.caption:pointerover Path">
+      <Setter Property="Stroke" Value="{DynamicResource Text}" />
+      <Setter Property="Fill" Value="{DynamicResource Text}" />
+    </Style>
+    <Style Selector="Button.close:pointerover /template/ ContentPresenter">
+      <Setter Property="Background" Value="{DynamicResource Danger}" />
+      <Setter Property="Foreground" Value="White" />
+    </Style>
+    <Style Selector="Button.close:pointerover Path">
+      <Setter Property="Stroke" Value="White" />
+      <Setter Property="Fill" Value="White" />
+    </Style>
+
+    <!-- Primary action button (Export). -->
+    <Style Selector="Button.primary">
+      <Setter Property="Background" Value="{DynamicResource Accent}" />
+      <Setter Property="Foreground" Value="White" />
+      <Setter Property="FontSize" Value="{x:Static app:Typography.Body}" />
+      <Setter Property="Padding" Value="13,0" />
+      <Setter Property="Height" Value="24" />
+      <Setter Property="VerticalContentAlignment" Value="Center" />
+      <Setter Property="CornerRadius" Value="5" />
+    </Style>
+    <Style Selector="Button.primary:pointerover /template/ ContentPresenter">
+      <Setter Property="Background" Value="{DynamicResource AccentHover}" />
+    </Style>
+
+    <!-- Tool-palette radio buttons (Select / Blade / Slip / Hand / Zoom): the checked one shows white. -->
+    <Style Selector="RadioButton.tool">
+      <Setter Property="Foreground" Value="{DynamicResource MutedText}" />
+      <Setter Property="FontSize" Value="{x:Static app:Typography.Body}" />
+      <Setter Property="Padding" Value="8,4" />
+      <Setter Property="VerticalContentAlignment" Value="Center" />
+    </Style>
+    <Style Selector="RadioButton.tool:checked">
+      <Setter Property="Foreground" Value="White" />
+    </Style>
+    <!-- Shrink the Fluent radio bullet (default 20px) to suit the compact toolbar. -->
+    <Style Selector="RadioButton.tool /template/ Ellipse#OuterEllipse">
+      <Setter Property="Width" Value="15" />
+      <Setter Property="Height" Value="15" />
+    </Style>
+    <Style Selector="RadioButton.tool /template/ Ellipse#CheckOuterEllipse">
+      <Setter Property="Width" Value="15" />
+      <Setter Property="Height" Value="15" />
+    </Style>
+    <Style Selector="RadioButton.tool /template/ Ellipse#CheckGlyph">
+      <Setter Property="Width" Value="6" />
+      <Setter Property="Height" Value="6" />
+    </Style>
+
+    <!-- Transport buttons under the program monitor. -->
+    <Style Selector="Button.transport">
+      <Setter Property="Width" Value="30" />
+      <Setter Property="Height" Value="26" />
+      <Setter Property="Padding" Value="0" />
+      <Setter Property="Background" Value="{DynamicResource RaisedBg}" />
+      <Setter Property="Foreground" Value="{DynamicResource Text}" />
+      <Setter Property="HorizontalContentAlignment" Value="Center" />
+      <Setter Property="VerticalContentAlignment" Value="Center" />
+      <Setter Property="CornerRadius" Value="5" />
+      <Setter Property="FontSize" Value="{x:Static app:Typography.Emphasis}" />
+    </Style>
+    <!-- Play/Pause is the primary transport control — carry the accent so it reads as primary. -->
+    <Style Selector="Button.transport.play">
+      <Setter Property="Background" Value="{DynamicResource Accent}" />
+      <Setter Property="Foreground" Value="White" />
+    </Style>
+    <Style Selector="Button.transport.play:pointerover /template/ ContentPresenter">
+      <Setter Property="Background" Value="{DynamicResource AccentHover}" />
+      <Setter Property="Foreground" Value="White" />
+    </Style>
+    <Style Selector="Button.transport.play:pressed /template/ ContentPresenter">
+      <Setter Property="Background" Value="{DynamicResource Accent}" />
+      <Setter Property="Foreground" Value="White" />
+    </Style>
+
+    <!-- Inspector section headers (InspectorPanel.cs Section(), Classes="inspectorSection") draw their own
+         chevron from Icons.cs, matching the effect headers' eye/× icon set — Fluent's built-in chevron Path
+         can't be resized to match (Stretch="None", see the ExpanderMinHeight comment above), so it's
+         collapsed to zero here instead. The Border lives inside the header ToggleButton's own ControlTheme,
+         one template level below the Expander's — /template/ pierces one level only, so the selector must
+         route through ToggleButton#ExpanderHeader explicitly. -->
+    <Style Selector="Expander.inspectorSection /template/ ToggleButton#ExpanderHeader /template/ Border#ExpandCollapseChevronBorder">
+      <Setter Property="Width" Value="0" />
+      <Setter Property="Height" Value="0" />
+      <Setter Property="Margin" Value="0" />
+      <Setter Property="IsVisible" Value="False" />
+    </Style>
+
+    <!-- Each Inspector section reads as its own card: a Border that Section() wraps around the Expander
+         (a step darker than the panel — Palette.SectionBg — rounded, 1px edge). The Fluent Expander's own
+         header/content fills and separator borders would paint over that card, so they're stripped here.
+         Part names: the header is ToggleButton#ExpanderHeader (see the chevron style above); the content
+         host is Border#ExpanderContent. -->
+    <Style Selector="Expander.inspectorSection">
+      <Setter Property="Background" Value="Transparent" />
+      <Setter Property="BorderThickness" Value="0" />
+    </Style>
+    <Style Selector="Expander.inspectorSection /template/ ToggleButton#ExpanderHeader">
+      <Setter Property="Background" Value="Transparent" />
+      <Setter Property="BorderThickness" Value="0" />
+    </Style>
+    <Style Selector="Expander.inspectorSection /template/ Border#ExpanderContent">
+      <Setter Property="Background" Value="Transparent" />
+      <Setter Property="BorderThickness" Value="0" />
+    </Style>
+  </Application.Styles>
+</Application>

@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The mixer and master clock are tested against fakes (no FFmpeg, no audio device), so this
+         project needs neither a RuntimeIdentifier nor native packages. -->
+    <ProjectReference Include="..\..\src\Sprocket.Audio\Sprocket.Audio.csproj" />
+  </ItemGroup>
+
+</Project>

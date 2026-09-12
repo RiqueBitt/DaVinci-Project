@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- Export round-trips through real FFmpeg 8 encode + decode; the natives resolve at runtime via
+         Sprocket.Media's FFmpegLoader from the output dir (UsesFFmpegNatives copies them from
+         ./.ffmpeg-cache) or %SPROCKET_FFMPEG8_DIR% (CI). The win-x64 RID is kept for a stable
+         Windows output layout (as Media.Tests does). -->
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == '' and $([MSBuild]::IsOSPlatform('Windows'))">win-x64</RuntimeIdentifier>
+    <UsesFFmpegNatives>true</UsesFFmpegNatives>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The export renders frames on an offscreen raster Skia surface, so the native libSkiaSharp is needed.
+         Pinned to 3.119.4 to match Sprocket.Render (ARCHITECTURE.md §14). -->
+    <PackageReference Include="SkiaSharp.NativeAssets.Win32" Version="3.119.4" />
+    <PackageReference Include="SkiaSharp.NativeAssets.Linux.NoDependencies" Version="3.119.4" />
+    <PackageReference Include="SkiaSharp.NativeAssets.macOS" Version="3.119.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Sprocket.Export\Sprocket.Export.csproj" />
+  </ItemGroup>
+
+</Project>

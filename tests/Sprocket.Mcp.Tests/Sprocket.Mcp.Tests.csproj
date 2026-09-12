@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Tests for the in-process MCP server (PLAN.md step 38): runtime-id registry, state formatting, the
+       tool surface over a fake (synchronous, in-memory) editor session, and an end-to-end pass with the
+       SDK's real client over an in-memory stream transport — no ports, CI-safe. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Sprocket.Mcp\Sprocket.Mcp.csproj" />
+  </ItemGroup>
+
+</Project>

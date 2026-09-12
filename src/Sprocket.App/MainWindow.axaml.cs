@@ -1,0 +1,4620 @@
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using Avalonia;
+using Avalonia.Automation;
+using Avalonia.Controls;
+using Avalonia.Controls.Primitives;
+using Avalonia.Input;
+using Avalonia.Layout;
+using Avalonia.LogicalTree;
+using Avalonia.Markup.Xaml;
+using Avalonia.Media;
+using Avalonia.Platform.Storage;
+using Avalonia.Threading;
+using Avalonia.VisualTree;
+using Sprocket.App.Inspector;
+using Sprocket.App.MediaBrowser;
+using Sprocket.Audio;
+using Sprocket.Core.Audio;
+using Sprocket.Core.Commands;
+using Sprocket.Core.Model;
+using Sprocket.Core.Rendering;
+using Sprocket.Core.Timing;
+using Sprocket.Export;
+using Sprocket.Persistence;
+using Sprocket.Persistence.Interchange;
+using Sprocket.Playback;
+using Sprocket.Render;
+using Ellipse = Avalonia.Controls.Shapes.Ellipse; // aliased so it doesn't drag Shapes.Path into scope (clashes with System.IO.Path)
+using ShapesPath = Avalonia.Controls.Shapes.Path;
+
+namespace Sprocket.App;
+
+/// <summary>
+/// The editor shell (PLAN.md step 11, UI.md §1/§2): a custom-chrome window (per-OS — see
+/// <see cref="ConfigureWindowChrome"/>) with an inline menu bar (the system menu bar on macOS),
+/// splitter-resizable Project / Program / Inspector panes over a full-width Timeline, and a status bar with
+/// live telemetry. The full menu / command surface is wired in step 16c — File (New / Open / Open Sample /
+/// Save / Save As / Import / Export / Exit), Edit (undo/redo + clip cut/copy/paste/delete), Clip (unlink / nudge), Effects
+/// (apply from the catalog), View (zoom / snapping / guides / panel toggles), Window (reset layout) and Help
+/// (About) — every editing action routing through <see cref="EditHistory"/> so it stays undoable. Items whose
+/// feature lands in a later step (Select All, Link) stay visibly disabled.
+/// </summary>
+public partial class MainWindow : Window
+{
+    private readonly PlaybackEngine? _engine;
+    private readonly Project? _project;
+    private readonly Proxy.ProxyService? _proxy; // session proxy service (PLAN.md step 18); owned by App
+    private readonly Proxy.ProxyAdvisor _proxyAdvisor = new(); // playback drop monitor → proxy recommendations
+    private readonly Sprocket.Audio.AudioEngine? _audioClock; // live loudness source for the mixer meters (PLAN.md step 30); owned by the engine
+    private readonly EditHistory _history = new();
+    private AutosaveService? _autosave; // periodic debounced autosave (PLAN.md step 20)
+    private UserSettings _userSettings = UserSettingsFile.Load(); // user-scoped app preferences (PLAN.md step 38)
+
+    private ThumbnailService? _thumbnails;
+    private MediaBrowserPanel? _mediaBrowser;
+    private Mixer.MixerView? _mixer; // audio mixer hosted in the Project panel's Audio tab (PLAN.md step 30)
+    private InspectorPanel? _inspector;
+    private TimelineControl? _timeline;
+    private ContextMenu? _clipContextMenu; // the open clip right-click menu — closed before showing another (only one at a time)
+    private Clip? _selectedClip; // the timeline selection (keyframe navigation targets its keyframes, step 16d)
+
+    // Inline track-rename editor (overlaid on the timeline): the TextBox and the track being renamed.
+    private TextBox? _trackRenameEditor;
+    private Sprocket.Core.Model.Track? _renameTarget;
+    private TextBox? _titleTextEditor;
+    private Sprocket.Core.Model.Clip? _titleEditTarget;
+
+    // Dual monitors (PLAN.md step 17): the Program monitor wraps the main engine; the Source monitor previews
+    // the selected clip's source. The transport bar drives whichever is active.
+    private ProgramMonitor? _program;
+    private SourceMonitor? _source;
+    private IMonitor? _active;
+    private PreviewSurface? _preview;
+    private ScopeState? _scopeState; // shared grading-scope state: monitor surface produces, ScopeView consumes (PLAN.md step 34)
+    private Button? _playPause;
+    private ShapesPath? _playPauseIcon; // swapped between Icons.Play / Icons.Pause by SetPlayPauseGlyph
+    private Button? _prevKeyframeButton, _nextKeyframeButton;
+    private Slider? _scrubber;
+    private TextBlock? _positionText, _durationText;
+
+    private bool _suppressSeek;        // guards programmatic scrubber updates from re-triggering a seek
+    private long _lastScrubberSeekFrame = -1; // last frame-snapped scrubber seek, so same-frame drags don't re-seek
+    private bool _exporting;
+    private bool _rendering;           // a preview render is in flight (same quiesce discipline as export, PLAN.md step 32)
+    private RenderCache.RenderCacheService? _renderCache; // the session's preview render cache (PLAN.md step 32)
+    private DispatcherTimer? _renderCacheRefresh;          // debounces the post-edit re-hash (drags fire Changed per mutation)
+    private MenuItem? _renderSelectionMenuItem, _deleteRenderFilesMenuItem; // Sequence ▸ render commands (step 32)
+    private MenuItem? _freezeClipAudioMenuItem, _unfreezeClipAudioMenuItem; // Sequence ▸ audio freeze (step 41)
+    private Export.ExportQueue? _exportQueue;         // lazily built on first Export Queue use (PLAN.md step 29)
+    private ExportQueueWindow? _exportQueueWindow;    // the (reused) queue window, or null when closed
+    private int _savedUndoCount;       // history depth at the last save; document is clean while it matches
+    private string _projectName = "Untitled";
+    private string? _currentProjectPath; // the file this project was loaded from / last saved to (null = untitled)
+    private bool _closeApproved;       // the close/quit gate has already been answered for this window's close
+    private bool _closePromptOpen;     // the close/quit gate is on screen — never stack a second one
+    private bool _unsavedPromptOpen;   // an unsaved-changes prompt is on screen — never stack a second one
+    private CancellationTokenSource? _exportCts;   // File ▸ Export's token, so the close/quit gate can stop it
+    private TaskCompletionSource? _exportFinished; // completes once the live export has unwound and cleaned up
+
+    // Controls captured for later updates.
+    private TextBlock? _statusText, _telemetryText, _engineStateText, _saveStateText, _timelineHeader;
+    private Ellipse? _stateDot;
+
+    // MCP indicator (PLAN.md step 38): visible only while the app-scoped MCP listener runs.
+    private StackPanel? _mcpStatusPanel;
+    private StackPanel? _updateBadge;
+    private TextBlock? _updateBadgeLabel;
+    private Ellipse? _updateBadgeDot, _helpMenuUpdateDot, _checkUpdatesMenuDot;
+    private Border? _updateToast;
+    private TextBlock? _updateToastText;
+    private DispatcherTimer? _updateToastTimer;
+    private UpdateService? _updateService;
+    private Ellipse? _mcpDot;
+    private TextBlock? _mcpLabel;
+    private McpServerService? _mcpService;
+
+    // Status-bar telemetry (PLAN.md step 29, UI.md §3.7). The live readout (state + GPU/hw-accel + fps) is polled
+    // on a slow UI timer, and — critically for the no-per-frame-work rule (ARCHITECTURE.md §1) — the timer runs
+    // ONLY while playing: it reads the engine's existing cumulative counters (a couple of Interlocked reads) at 1 Hz
+    // and does zero work on the render/decode hot path. At idle it is stopped and the readout settles to the nominal
+    // sequence rate on the state-change event, so a paused editor incurs no periodic wake-ups.
+    private DispatcherTimer? _telemetryTimer;
+    private long _prevDelivered, _prevStatsTs; // baseline for the live-fps delta (frames delivered, Stopwatch ticks)
+    private MenuItem? _undoMenuItem, _redoMenuItem;
+    private Button? _exportButton, _maxButton;
+    private ShapesPath? _maxButtonIcon; // swapped between Icons.Maximize / Icons.Restore by OnPropertyChanged
+    private Control? _root;
+    private WindowState _lastNonMinimizedState = WindowState.Normal; // persisted on close (ignores Minimized/FullScreen)
+    private WindowState _stateBeforeFullScreen = WindowState.Normal; // restored when leaving View ▸ Full Screen
+
+    // Full-screen preview (View ▸ Full Screen Preview, Ctrl+F): the shared PreviewSurface is reparented into the
+    // window-covering FullscreenPreviewHost overlay while the window goes fullscreen (the full-screen viewer convention in leading editors).
+    private Panel? _fullscreenPreviewHost;
+    private Panel? _previewHome; // the monitor DockPanel the surface is re-docked into on exit
+    private bool _previewFullscreen;
+    private bool _enteredWindowFullScreenForPreview; // whether exiting the preview should also leave fullscreen
+    private MonitorZoom _zoomBeforeFullscreenPreview;
+
+    // Command-menu items refreshed on submenu open (context-enabling) + the View toggles / panes.
+    private MenuItem? _cutMenuItem, _copyMenuItem, _pasteMenuItem, _deleteMenuItem, _rippleDeleteMenuItem;
+    private MenuItem? _selectAllMenuItem; // Edit ▸ Select All (multi-clip selection, PLAN.md step 54)
+    private MenuItem? _linkMenuItem, _unlinkMenuItem, _nudgeLeftMenuItem, _nudgeRightMenuItem, _clipSpeedMenuItem;
+    // Split at Playhead / Duplicate / Enable toggle (PLAN.md step 53)
+    private MenuItem? _clipSplitMenuItem, _clipDuplicateMenuItem, _clipEnableMenuItem;
+    private MenuItem? _createMulticamMenuItem; // Clip ▸ Create Multicam Source (PLAN.md step 24)
+    private MenuItem? _clipNormalizeMenuItem;  // Clip ▸ Normalize Audio (PLAN.md step 30)
+    private MenuItem? _clipInterpretFootageMenuItem;  // Clip ▸ Interpret Footage (PLAN.md step 42)
+    // Frame hold + stop-motion frame edits (PLAN.md step 43)
+    private MenuItem? _clipFrameHoldOptionsMenuItem, _clipAddFrameHoldMenuItem, _clipInsertFrameHoldSegmentMenuItem;
+    private MenuItem? _clipDuplicateFrameMenuItem, _clipRemoveFrameMenuItem;
+    private MenuItem? _nestMenuItem, _openSequenceMenuItem; // Sequence menu (PLAN.md step 23)
+    private MenuItem? _snappingMenuItem, _guidesMenuItem, _showProjectMenuItem, _showInspectorMenuItem, _showStatsMenuItem,
+        _showProxyStatusMenuItem;
+    private MenuItem? _fullScreenMenuItem; // View ▸ Full Screen (checked while fullscreen)
+    // View ▸ Playback Auto-Scroll (radio group; the timeline's AutoScroll property is the source of truth)
+    private MenuItem? _autoScrollNoneMenuItem, _autoScrollPageMenuItem, _autoScrollSmoothMenuItem;
+    private PlaybackStatsOverlay? _statsOverlay; // floating playback-diagnostics window (View ▸ Playback Statistics)
+    private ProxyStatusWindow? _proxyWindow; // proxy status + live control window (View ▸ Proxy, PLAN.md step 18)
+    private MenuItem? _effectsMenu;
+    private ToggleButton? _snappingToggle, _guidesToggle;
+    private Grid? _workspaceGrid, _outerGrid;
+    private Border? _projectPane, _inspectorPane;
+    private GridSplitter? _projectSplitter, _inspectorSplitter;
+
+    // Work-area focus ring (Tab / Shift+Tab, Shift+1–4). The active area is explicit shell state rather than
+    // something inferred from whichever child control happens to hold focus: it survives focus landing on the
+    // toolbar or status bar, drives the accent pane edge, and is what the direct chords set. Kept in sync with
+    // real focus by OnShellGotFocus.
+    private Panel? _shellRoot;
+    private Border? _monitorPane, _timelinePane;
+    private Control? _projectAreaTarget, _monitorAreaTarget, _timelineAreaTarget, _inspectorAreaTarget;
+    private WorkArea _activeArea = WorkArea.Timeline;
+
+    /// <summary>The Sprocket project file type (a JSON sidecar) for the open / save-as pickers.</summary>
+    private static readonly FilePickerFileType SprocketProjectFileType =
+        new("DaVinci Project project") { Patterns = ["*.sprocket.json", "*.json"] };
+
+    /// <summary>Import file-type filters for the media open dialog (PLAN.md step 27 import coverage): the common
+    /// containers and audio-only formats the FFmpeg 8 decode path handles. Unsupported / corrupt files still fail
+    /// gracefully per file (see <see cref="Import"/>), so the "All files" fall-through stays available.</summary>
+    private static readonly FilePickerFileType VideoFileType = new("Video")
+    {
+        Patterns =
+        [
+            "*.mp4", "*.m4v", "*.mov", "*.mkv", "*.webm", "*.avi", "*.mxf",
+            "*.ts", "*.m2ts", "*.mts", "*.mpg", "*.mpeg", "*.wmv", "*.flv", "*.ogv", "*.3gp",
+        ],
+    };
+    private static readonly FilePickerFileType AudioFileType = new("Audio")
+    {
+        Patterns = ["*.wav", "*.mp3", "*.aac", "*.m4a", "*.flac", "*.ac3", "*.opus", "*.ogg", "*.wma", "*.aif", "*.aiff"],
+    };
+
+    /// <summary>Image import filter (PLAN.md step 42): single stills and numbered image-sequence frames. EXR is
+    /// intentionally excluded (unreliable decoder coverage in the bundled gpl natives).</summary>
+    private static readonly FilePickerFileType ImageFileType = new("Images")
+    {
+        Patterns = ["*.png", "*.jpg", "*.jpeg", "*.tif", "*.tiff", "*.bmp", "*.tga", "*.webp", "*.dpx"],
+    };
+
+    /// <summary>Raised when File ▸ New / Open wants the composition root to swap to a freshly built session over
+    /// <see cref="SessionRequest.Project"/> (PLAN.md step 16c). Handled by <see cref="App"/>.</summary>
+    public event Action<SessionRequest>? SessionRequested;
+
+    /// <summary>A request to start a new editing session over an already-built project.</summary>
+    /// <param name="Project">The new (empty) or freshly loaded project.</param>
+    /// <param name="Status">A status line describing the session.</param>
+    /// <param name="ProjectPath">The file it was loaded from, or <see langword="null"/> for an untitled project.</param>
+    public readonly record struct SessionRequest(Project Project, string Status, string? ProjectPath);
+
+    /// <summary>The chosen audio output device (an OpenAL specifier, "" = system default) for this window's
+    /// settings — read by the composition root so a session swap opens on the same device.</summary>
+    internal string AudioDeviceSetting => _userSettings.AudioOutputDevice;
+
+    // Parameterless ctor for the XAML designer / tooling.
+    public MainWindow() : this(null, null, string.Empty, null) { }
+
+    // Internal (not public) only because WindowPlacement is: the composition root is the sole caller.
+    internal MainWindow(PlaybackEngine? engine, Project? project, string status, string? projectPath = null,
+        Proxy.ProxyService? proxy = null, Sprocket.Audio.AudioEngine? audioClock = null,
+        WindowPlacement? placement = null)
+    {
+        AvaloniaXamlLoader.Load(this);
+        _engine = engine;
+        _project = project;
+        _proxy = proxy;
+        _audioClock = audioClock;
+        _currentProjectPath = projectPath;
+
+        _root = this.FindControl<Control>("Root");
+        _fullscreenPreviewHost = this.FindControl<Panel>("FullscreenPreviewHost");
+        _statusText = this.FindControl<TextBlock>("StatusText")!;
+        _telemetryText = this.FindControl<TextBlock>("TelemetryText")!;
+        _engineStateText = this.FindControl<TextBlock>("EngineStateText")!;
+        _stateDot = this.FindControl<Ellipse>("StateDot")!;
+        _saveStateText = this.FindControl<TextBlock>("SaveStateText")!;
+        _mcpStatusPanel = this.FindControl<StackPanel>("McpStatus");
+        _mcpDot = this.FindControl<Ellipse>("McpDot");
+        _mcpLabel = this.FindControl<TextBlock>("McpLabel");
+        _updateBadge = this.FindControl<StackPanel>("UpdateBadge");
+        _updateBadgeLabel = this.FindControl<TextBlock>("UpdateBadgeLabel");
+        _updateBadgeDot = this.FindControl<Ellipse>("UpdateBadgeDot");
+        _helpMenuUpdateDot = this.FindControl<Ellipse>("HelpMenuUpdateDot");
+        _checkUpdatesMenuDot = this.FindControl<Ellipse>("CheckUpdatesMenuDot");
+        _updateToast = this.FindControl<Border>("UpdateToast");
+        _updateToastText = this.FindControl<TextBlock>("UpdateToastText");
+        _timelineHeader = this.FindControl<TextBlock>("TimelineHeader")!;
+        _undoMenuItem = this.FindControl<MenuItem>("UndoMenuItem")!;
+        _redoMenuItem = this.FindControl<MenuItem>("RedoMenuItem")!;
+        _exportButton = this.FindControl<Button>("ExportButton")!;
+        _maxButton = this.FindControl<Button>("MaxButton")!;
+        _maxButtonIcon = this.FindControl<ShapesPath>("MaxButtonIcon")!;
+
+        // Per-OS chrome must be settled before the window is shown (App.OnSessionRequested builds a fresh
+        // MainWindow on File ▸ New/Open, so the constructor is the right hook).
+        ConfigureWindowChrome();
+
+        // Reopen the way the user left it. A session swap (File ▸ New / Open / Open Sample builds a replacement
+        // window) hands us the outgoing window's live geometry, so opening a project never moves or resizes the
+        // shell; the persisted maximized-or-not is only the fresh-launch fallback, and the position then comes
+        // from WindowStartupLocation="CenterScreen" in the XAML.
+        if (placement is { } carried)
+        {
+            carried.ApplyTo(this);
+            _stateBeforeFullScreen = carried.StateBeforeFullScreen;
+            _lastNonMinimizedState = carried.PersistableState;
+        }
+        else
+        {
+            WindowState = WindowStateStore.Load();
+        }
+
+        WireWindowChrome();
+        WireMenu();
+        WireCommandMenus();
+        PopulateProjectChrome(status);
+        WireMediaBrowser();
+        WireInspector();
+        // After the panes are resolved (WireCommandMenus / WireMediaBrowser / WireInspector) and before the
+        // no-engine early return below, so Tab still cycles the shell of an empty project.
+        WireWorkAreaFocus();
+
+        _history.Changed += OnHistoryChanged;
+        OnHistoryChanged(); // initialise menu-enable + save-state
+
+        // MCP indicator (PLAN.md step 38): mirror the app-scoped server's state so the user always sees when
+        // the editor is externally controllable. The service outlives this window; unhooked in OnClosed.
+        if (Application.Current is App { McpService: { } mcpService })
+        {
+            _mcpService = mcpService;
+            mcpService.StateChanged += UpdateMcpStatus;
+            UpdateMcpStatus();
+        }
+
+        // Update-available badge (PLAN.md step 45): mirror the app-scoped checker's result. Like the MCP
+        // indicator, the service outlives this window; unhooked in OnClosed.
+        if (Application.Current is App { UpdateService: { } updateService })
+        {
+            _updateService = updateService;
+            updateService.StateChanged += RefreshUpdateAffordances;
+            RefreshUpdateAffordances();
+        }
+        if (_updateBadge is not null)
+            _updateBadge.PointerPressed += (_, _) => _ = ShowUpdateDialogAsync();
+        if (this.FindControl<Button>("UpdateToastViewButton") is { } toastView)
+            toastView.Click += (_, _) => { HideUpdateToast(); _ = ShowUpdateDialogAsync(); };
+        if (this.FindControl<Button>("UpdateToastDismissButton") is { } toastDismiss)
+            toastDismiss.Click += (_, _) => HideUpdateToast();
+
+        // Autosave (PLAN.md step 20): a debounced sidecar write driven off the dirty signal. Beside the project
+        // file once it has one, else a per-user untitled slot — so a crash before the first manual save is still
+        // recoverable. Independent of playback, so it runs even when no engine is available.
+        if (_project is not null)
+            _autosave = new AutosaveService(_project, _history, () => _currentProjectPath,
+                TimeSpan.FromSeconds(_userSettings.AutosaveIntervalSeconds));
+
+        // Preview render cache (PLAN.md step 32): the cache dir is derived from the project path at session
+        // start; still-valid renders from an earlier session validate immediately (content-hash keyed). Wire
+        // the playback seams so the engine replays cached video segments and the feeder cached audio.
+        if (_project is not null)
+        {
+            _renderCache = new RenderCache.RenderCacheService(_project, projectPath);
+            if (_engine is not null)
+                _engine.RenderCache = _renderCache;
+            if (_audioClock is not null)
+                _audioClock.RenderCache = _renderCache;
+        }
+
+        if (_engine is null)
+        {
+            // No media: the shell still renders; just disable the live controls.
+            SetEnabled(false);
+            return;
+        }
+
+        WireTransport();
+    }
+
+    // ── Window chrome (per-OS): drag, double-click maximize, min/max/close ─────────────────────────
+
+    /// <summary>Left inset reserved for the macOS traffic lights. AppKit places the three standard window
+    /// buttons at a fixed offset inside the titlebar and exposes no width for them, so this is the
+    /// conventional value (the same one Electron's <c>hiddenInset</c> and VS Code use).</summary>
+    private const double MacTrafficLightInset = 78;
+
+    /// <summary>Title-bar height on macOS. Taller than the Windows/Linux 34 px so the traffic lights, which
+    /// AppKit centres in the system's 28 pt titlebar band at the top of the window, sit comfortably.</summary>
+    private const double MacTitleBarHeight = 38;
+
+    /// <summary>Picks the window chrome for the host OS. All three platforms draw Sprocket's own title bar,
+    /// but they get there differently:
+    /// <list type="bullet">
+    /// <item><b>Windows</b> — <see cref="WindowDecorations.BorderOnly"/> (native frame, no system titlebar)
+    /// <i>plus</i> the extend hint, which is what activates the <c>WindowDecorationProperties.ElementRole</c>
+    /// annotations in the XAML: the bar and its caption buttons become real non-client regions (verified:
+    /// double-clicking the bar restores a maximized window), giving the snap-layouts flyout on the maximize
+    /// button, Aero Shake and the right-click system menu. <see cref="WindowDecorations.Full"/> is deliberately
+    /// <i>not</i> used here — with the client area extended, Avalonia then renders its own client-side
+    /// decorations (a second icon, title and caption glyph) on top of ours.</item>
+    /// <item><b>macOS</b> — <see cref="WindowDecorations.Full"/> plus the extend hint, the standard "unified
+    /// titlebar" arrangement. AppKit keeps drawing the traffic lights, which are the platform's
+    /// close/minimise/zoom and full-screen affordance, and our content runs underneath them; the system draws
+    /// the decorations, so Avalonia does not add its own. Our caption buttons are hidden, the leading edge is
+    /// inset to clear the lights, and the menu bar moves to the system menu bar (<see cref="MacMenuBridge"/>).
+    /// <see cref="WindowDecorations.BorderOnly"/> is what produced the double title bar: it leaves the
+    /// <c>NSWindow</c> titled but suppresses the traffic lights, so AppKit's empty strip sat above our own bar.</item>
+    /// <item><b>Linux</b> — <see cref="WindowDecorations.BorderOnly"/> client-side decorations, the long-standing
+    /// GNOME/KDE convention for app-drawn headers, and no extend hint. The <c>ElementRole</c> annotations are
+    /// inert there, so <see cref="WireWindowChrome"/>'s <see cref="Window.BeginMoveDrag"/> handler does the work.</item>
+    /// </list></summary>
+    private void ConfigureWindowChrome()
+    {
+        if (OperatingSystem.IsLinux())
+        {
+            WindowDecorations = WindowDecorations.BorderOnly;
+            return;
+        }
+
+        bool mac = OperatingSystem.IsMacOS();
+        WindowDecorations = mac ? WindowDecorations.Full : WindowDecorations.BorderOnly;
+        ExtendClientAreaToDecorationsHint = true;
+        ExtendClientAreaTitleBarHeightHint = -1; // OS default; the drag area is the ElementRole.TitleBar element
+
+        if (!mac)
+            return;
+
+        this.FindControl<Border>("TitleBar")!.Height = MacTitleBarHeight;
+        this.FindControl<StackPanel>("TitleBarLeading")!.Margin = new Thickness(MacTrafficLightInset, 0, 6, 0);
+        this.FindControl<StackPanel>("CaptionButtons")!.IsVisible = false;
+        _maxButton = null;     // hidden — nothing to re-glyph on WindowState changes
+        _maxButtonIcon = null;
+        // The menus move to the system menu bar; MacMenuBridge.Attach mirrors this same control at the end of
+        // WireCommandMenus, so it stays the source of truth even though it is never shown.
+        this.FindControl<Menu>("MenuBar")!.IsVisible = false;
+    }
+
+    private void WireWindowChrome()
+    {
+        var titleBar = this.FindControl<Border>("TitleBar")!;
+
+        // Move-drag. Where the client area is extended, ElementRole.TitleBar already makes the bar a real
+        // caption and the platform runs the move loop itself — a press consumed as non-client never surfaces
+        // as a pointer event, so this handler simply doesn't run there. It stays wired on every platform as
+        // the fallback that guarantees the window is movable.
+        titleBar.PointerPressed += (_, e) =>
+        {
+            // The menu bar lives inside this draggable title-bar Border, and a drop-down item's press
+            // bubbles up the logical tree through the Menu to here. Starting a window move-drag for it would
+            // call Pointer.Capture(null) and tear down the capture the menu needs to deliver the click — so
+            // every menu command would silently do nothing (keyboard accelerators were unaffected). Only the
+            // bare caption is draggable: skip the drag for any press that originates within the menu.
+            if (e.Source is ILogical src && src.GetSelfAndLogicalAncestors().OfType<Menu>().Any())
+                return;
+            if (e.GetCurrentPoint(titleBar).Properties.IsLeftButtonPressed)
+                BeginMoveDrag(e);
+        };
+
+        // Double-click to maximize/restore, in contrast, is NOT a fallback: on the extended path the platform
+        // is verified to service it (Windows restores a maximized window from a double-click on the caption),
+        // and handling it here as well would toggle twice.
+        if (!ExtendClientAreaToDecorationsHint)
+            titleBar.DoubleTapped += (_, _) => ToggleMaximize();
+
+        // macOS has no caption buttons of ours to wire (the traffic lights are AppKit's). Elsewhere these
+        // handlers stay wired even under non-client hit-testing, where Win32 may service the click itself:
+        // whichever path fires, the outcome is the same.
+        if (OperatingSystem.IsMacOS())
+            return;
+
+        this.FindControl<Button>("MinButton")!.Click += (_, _) => WindowState = WindowState.Minimized;
+        _maxButton!.Click += (_, _) => ToggleMaximize();
+        this.FindControl<Button>("CloseButton")!.Click += (_, _) => Close();
+    }
+
+    private void ToggleMaximize()
+    {
+        // While fullscreen, the caption button / title double-click reads as "get me out of fullscreen".
+        if (WindowState == WindowState.FullScreen)
+        {
+            ToggleWindowFullScreen();
+            return;
+        }
+        WindowState = WindowState == WindowState.Maximized ? WindowState.Normal : WindowState.Maximized;
+    }
+
+    /// <summary>View ▸ Full Screen (F11; ⌃⌘F on macOS, matching the system shortcut alongside the native
+    /// green button): toggles <see cref="WindowState.FullScreen"/>, restoring the pre-fullscreen Normal/Maximized
+    /// state on exit. Esc also exits (OnKeyDown). Fullscreen is transient — never persisted by WindowStateStore.</summary>
+    private void ToggleWindowFullScreen()
+    {
+        if (WindowState == WindowState.FullScreen)
+        {
+            WindowState = _stateBeforeFullScreen;
+        }
+        else
+        {
+            _stateBeforeFullScreen = WindowState == WindowState.Maximized ? WindowState.Maximized : WindowState.Normal;
+            WindowState = WindowState.FullScreen;
+        }
+    }
+
+    /// <summary>Snapshots this window's live geometry for the replacement window a session swap builds (see
+    /// <see cref="WindowPlacement"/>). A minimized shell reopens at the state it was minimized from.</summary>
+    internal WindowPlacement CapturePlacement() => new(
+        WindowPlacement.StateToCarry(WindowState, _lastNonMinimizedState),
+        _stateBeforeFullScreen,
+        Position,
+        ClientSize);
+
+    protected override void OnPropertyChanged(AvaloniaPropertyChangedEventArgs change)
+    {
+        base.OnPropertyChanged(change);
+        if (change.Property == WindowStateProperty && _root is not null)
+        {
+            // With the client area extended (or frameless), a maximized window extends past the work area by
+            // OffScreenMargin; inset the content so nothing is clipped under the screen edges / taskbar. This
+            // is a Windows artifact — OffScreenMargin is always zero on macOS, but skipping it there keeps the
+            // intent obvious.
+            _root.Margin = WindowState == WindowState.Maximized && !OperatingSystem.IsMacOS()
+                ? OffScreenMargin
+                : default;
+            if (_maxButton is not null)
+            {
+                bool zoomed = WindowState is WindowState.Maximized or WindowState.FullScreen;
+                if (_maxButtonIcon is not null)
+                    _maxButtonIcon.Data = zoomed ? Icons.Restore : Icons.Maximize;
+                AutomationProperties.SetName(_maxButton,
+                    WindowState == WindowState.FullScreen ? "Exit full screen" : zoomed ? "Restore" : "Maximize");
+            }
+            // Remember the real state to persist — not a transient minimize, and not fullscreen either (a session
+            // closed while fullscreen should reopen at its pre-fullscreen Normal/Maximized state).
+            if (WindowState is not (WindowState.Minimized or WindowState.FullScreen))
+                _lastNonMinimizedState = WindowState;
+            if (_fullScreenMenuItem is not null)
+                _fullScreenMenuItem.IsChecked = WindowState == WindowState.FullScreen;
+        }
+    }
+
+    /// <summary>Whether closing this window has to stop and ask first — a running export to abandon, or
+    /// unsaved edits to lose. False once <see cref="ApproveClose"/> has recorded the user's answer.</summary>
+    internal bool NeedsClosePrompt => DiscardGuard.NeedsPrompt(_exporting, IsDirty, _closeApproved);
+
+    /// <summary>
+    /// The close gate for this window (the title-bar close button, <c>Alt+F4</c>, File ▸ Exit / Quit).
+    /// Avalonia gives no way to await a dialog from here, so the first attempt is cancelled, the user is
+    /// asked, and the close is re-issued once they answer.
+    ///
+    /// <para>An application-level Quit is <i>not</i> gated here — <see cref="App.OnShutdownRequested"/> owns
+    /// that. macOS does not route a Quit (⌘Q, the Dock menu, log-out) through <c>windowShouldClose</c>, so
+    /// cancelling a window close there does not abort the quit (Avalonia #6149); <c>applicationShouldTerminate</c>,
+    /// which Avalonia surfaces as <c>ShutdownRequested</c>, is the hook all three platforms honour. That path
+    /// calls <see cref="ApproveClose"/> before closing us, so the two gates never both fire.</para>
+    /// </summary>
+    protected override void OnClosing(WindowClosingEventArgs e)
+    {
+        if (NeedsClosePrompt)
+        {
+            e.Cancel = true;
+            _ = ConfirmThenCloseAsync();
+            return;
+        }
+        base.OnClosing(e);
+    }
+
+    /// <summary>Runs the close gate, then re-issues the close <see cref="OnClosing"/> cancelled. Backing out
+    /// of either question simply leaves the window open with the session untouched.</summary>
+    private async Task ConfirmThenCloseAsync()
+    {
+        try
+        {
+            if (!await ConfirmCloseAsync())
+                return;
+            _closeApproved = true;
+            Close();
+        }
+        catch (Exception ex)
+        {
+            // Nothing awaits this task, so an escaped exception would vanish and leave the window stuck open
+            // with no explanation. Log it and leave the session as it was — the user can retry the close.
+            CrashLog.Write("Failed to confirm closing", ex);
+        }
+    }
+
+    /// <summary>Marks this window's close as already answered, so <see cref="OnClosing"/> lets the next
+    /// <see cref="Window.Close()"/> through without prompting. Used by the two paths that ask on the window's
+    /// behalf: the app-level quit gate, and the File ▸ New / Open session swap (which closes the outgoing
+    /// window over a document the user has already answered for).</summary>
+    internal void ApproveClose() => _closeApproved = true;
+
+    protected override void OnClosed(EventArgs e)
+    {
+        if (_mcpService is { } mcpService)
+            mcpService.StateChanged -= UpdateMcpStatus; // the service outlives this window (session swaps)
+        if (_updateService is { } updateService)
+            updateService.StateChanged -= RefreshUpdateAffordances; // likewise app-scoped (PLAN.md step 45)
+        _updateToastTimer?.Stop();
+        WindowStateStore.Save(_lastNonMinimizedState); // remember maximized-or-not for next launch
+        _telemetryTimer?.Stop(); // stop the status-bar poll (harmless if already idle)
+        _statsOverlay?.Close(); // tear down the diagnostics overlay's poll timer
+        _proxyWindow?.Close(); // unsubscribes from the proxy service, which outlives this window (session swaps)
+        _autosave?.Dispose(); // stop the autosave timer for this session
+        _renderCacheRefresh?.Stop();
+        _renderCache?.Dispose(); // releases any open cached-audio readers (PLAN.md step 32)
+        _thumbnails?.Dispose(); // releases the cached thumbnail bitmaps
+        _scopeState?.Dispose(); // releases the scope sample surface (PLAN.md step 34)
+        _ = _source?.DisposeAsync(); // tears down the Source monitor's decoder/engine if one is open
+        base.OnClosed(e);
+    }
+
+    // ── Menu + keyboard ────────────────────────────────────────────────────────────────────────────
+
+    private void WireMenu()
+    {
+        // File
+        this.FindControl<MenuItem>("NewMenuItem")!.Click += (_, _) => NewProject();
+        this.FindControl<MenuItem>("OpenMenuItem")!.Click += (_, _) => _ = OpenProjectAsync();
+        this.FindControl<MenuItem>("OpenSampleMenuItem")!.Click += (_, _) => OpenSampleProject();
+        this.FindControl<MenuItem>("SaveMenuItem")!.Click += (_, _) => Save();
+        this.FindControl<MenuItem>("SaveAsMenuItem")!.Click += (_, _) => _ = SaveAsAsync();
+        this.FindControl<MenuItem>("ImportMenuItem")!.Click += (_, _) => _ = ImportDialogAsync();
+        this.FindControl<MenuItem>("RelinkMenuItem")!.Click += (_, _) => _ = RelinkMediaAsync();
+        this.FindControl<MenuItem>("ExportMenuItem")!.Click += (_, _) => _ = ExportAsync();
+        this.FindControl<MenuItem>("ExportQueueMenuItem")!.Click += (_, _) => OpenExportQueue();
+        this.FindControl<MenuItem>("ExportEdlMenuItem")!.Click += (_, _) => _ = ExportInterchangeAsync(InterchangeKind.Edl);
+        this.FindControl<MenuItem>("ExportFcpXmlMenuItem")!.Click += (_, _) => _ = ExportInterchangeAsync(InterchangeKind.FinalCutXml);
+        // Quit. Each desktop names and binds this differently, so the XAML carries the Windows form
+        // ("E_xit" / Alt+F4) and the other two are applied here:
+        //   Windows — File ▸ Exit, Alt+F4 (serviced by the window manager).
+        //   Linux   — File ▸ Quit, Ctrl+Q (GNOME HIG / freedesktop; the accelerator is in OnKeyDown).
+        //   macOS   — neither: the item is hidden below and AppKit's own "Quit Sprocket" ⌘Q in the
+        //             application menu is the only way out, which is what a Mac user reaches for.
+        MenuItem exitMenuItem = this.FindControl<MenuItem>("ExitMenuItem")!;
+        exitMenuItem.Click += (_, _) => Close();
+        if (OperatingSystem.IsLinux())
+        {
+            exitMenuItem.Header = "_Quit";
+            exitMenuItem.InputGesture = new KeyGesture(Key.Q, KeyModifiers.Control);
+        }
+
+        // Edit
+        _undoMenuItem!.Click += (_, _) => _history.Undo();
+        _redoMenuItem!.Click += (_, _) => _history.Redo();
+        this.FindControl<MenuItem>("PreferencesMenuItem")!.Click += (_, _) => _ = ShowPreferencesAsync();
+        this.FindControl<MenuItem>("PluginsMenuItem")!.Click += (_, _) => _ = ShowPluginManagerAsync();
+
+        // Help
+        this.FindControl<MenuItem>("CheckUpdatesMenuItem")!.Click += (_, _) => _ = CheckForUpdatesAsync();
+        this.FindControl<MenuItem>("ReportIssueMenuItem")!.Click += (_, _) => _ = OpenUriAsync(AboutDialog.ReportIssueUrl);
+        this.FindControl<MenuItem>("ThirdPartyNoticesMenuItem")!.Click += (_, _) => _ = ThirdPartyNoticesDialog.Show(this);
+        this.FindControl<MenuItem>("AboutMenuItem")!.Click += (_, _) => _ = AboutDialog.Show(this);
+
+        // Linux AppImage desktop integration (PLAN.md step 36): the two items are hidden by default and only
+        // ever surface on a running AppImage, one at a time per whether the launcher is already installed —
+        // refreshed each time the Help menu opens (a Help-menu Add/Remove or the first-run prompt flips it).
+        MenuItem addAppMenuItem = this.FindControl<MenuItem>("AddToApplicationsMenuMenuItem")!;
+        MenuItem removeAppMenuItem = this.FindControl<MenuItem>("RemoveFromApplicationsMenuMenuItem")!;
+        addAppMenuItem.Click += (_, _) => _ = AddToApplicationsMenuAsync();
+        removeAppMenuItem.Click += (_, _) => _ = RemoveFromApplicationsMenuAsync();
+        if (LinuxDesktopIntegration.IsAvailable)
+            this.FindControl<MenuItem>("HelpMenu")!.SubmenuOpened += (_, _) =>
+            {
+                bool installed = LinuxDesktopIntegration.IsInstalled;
+                addAppMenuItem.IsVisible = !installed;
+                removeAppMenuItem.IsVisible = installed;
+            };
+
+        KeyDown += OnKeyDown;
+    }
+
+    /// <summary>
+    /// Wires the editing menus that act on the selection (Edit ▸ Cut/Copy/Paste/Delete, Clip ▸ Unlink/Nudge),
+    /// builds the Effects menu from <see cref="EffectCatalog"/>, and connects the View / Window menus
+    /// (PLAN.md step 16c). The handlers read <see cref="_timeline"/> lazily, so this can run before the timeline
+    /// is attached. Context-enabling happens on submenu-open so the items reflect the current selection /
+    /// clipboard without per-edit bookkeeping.
+    /// </summary>
+    private void WireCommandMenus()
+    {
+        // Toolbar toggles are the source of truth for Snapping / Guides; the View menu mirrors them.
+        _snappingToggle = this.FindControl<ToggleButton>("SnappingToggle");
+        _guidesToggle = this.FindControl<ToggleButton>("GuidesToggle");
+
+        // Panes / grids for the View panel toggles + Window ▸ Reset Layout.
+        _workspaceGrid = this.FindControl<Grid>("WorkspaceGrid");
+        _outerGrid = this.FindControl<Grid>("OuterGrid");
+        _projectPane = this.FindControl<Border>("ProjectPane");
+        _projectSplitter = this.FindControl<GridSplitter>("ProjectSplitter");
+        _inspectorPane = this.FindControl<Border>("InspectorPane");
+        _inspectorSplitter = this.FindControl<GridSplitter>("InspectorSplitter");
+
+        // Inspector pane-header expand/collapse-all — sections are per-clip, so this acts on whatever the
+        // panel currently shows.
+        if (this.FindControl<InspectorPanel>("Inspector") is { } inspectorPanel)
+        {
+            this.FindControl<Button>("InspectorExpandAllButton")!.Click +=
+                (_, _) => inspectorPanel.SetAllSectionsExpanded(true);
+            this.FindControl<Button>("InspectorCollapseAllButton")!.Click +=
+                (_, _) => inspectorPanel.SetAllSectionsExpanded(false);
+        }
+
+        // ── Edit ──
+        _cutMenuItem = this.FindControl<MenuItem>("CutMenuItem")!;
+        _copyMenuItem = this.FindControl<MenuItem>("CopyMenuItem")!;
+        _pasteMenuItem = this.FindControl<MenuItem>("PasteMenuItem")!;
+        _deleteMenuItem = this.FindControl<MenuItem>("DeleteMenuItem")!;
+        _rippleDeleteMenuItem = this.FindControl<MenuItem>("RippleDeleteMenuItem")!;
+        _cutMenuItem.Click += (_, _) => _timeline?.CutSelected();
+        _copyMenuItem.Click += (_, _) => _timeline?.CopySelected();
+        _pasteMenuItem.Click += (_, _) => _timeline?.PasteAtPlayhead();
+        _deleteMenuItem.Click += (_, _) => _timeline?.DeleteSelected();
+        _rippleDeleteMenuItem.Click += (_, _) => _timeline?.RippleDeleteSelected();
+        _selectAllMenuItem = this.FindControl<MenuItem>("SelectAllMenuItem")!;
+        _selectAllMenuItem.Click += (_, _) => _timeline?.SelectAll();
+        this.FindControl<MenuItem>("EditMenu")!.SubmenuOpened += (_, _) => RefreshEditMenu();
+
+        // ── Clip ──
+        _clipSplitMenuItem = this.FindControl<MenuItem>("ClipSplitAtPlayheadMenuItem")!;
+        _clipDuplicateMenuItem = this.FindControl<MenuItem>("ClipDuplicateMenuItem")!;
+        _clipEnableMenuItem = this.FindControl<MenuItem>("ClipEnableMenuItem")!;
+        _clipSplitMenuItem.Click += (_, _) => _timeline?.SplitAtPlayhead();
+        _clipDuplicateMenuItem.Click += (_, _) => _timeline?.DuplicateSelected();
+        _clipEnableMenuItem.Click += (_, _) => _timeline?.ToggleSelectedEnabled();
+        _linkMenuItem = this.FindControl<MenuItem>("ClipLinkMenuItem")!;
+        _linkMenuItem.Click += (_, _) => _timeline?.LinkSelected();
+        _unlinkMenuItem = this.FindControl<MenuItem>("ClipUnlinkMenuItem")!;
+        _nudgeLeftMenuItem = this.FindControl<MenuItem>("NudgeLeftMenuItem")!;
+        _nudgeRightMenuItem = this.FindControl<MenuItem>("NudgeRightMenuItem")!;
+        _clipSpeedMenuItem = this.FindControl<MenuItem>("ClipSpeedMenuItem")!;
+        _unlinkMenuItem.Click += (_, _) => _timeline?.UnlinkSelected();
+        _nudgeLeftMenuItem.Click += (_, _) => _timeline?.NudgeSelected(-1);
+        _nudgeRightMenuItem.Click += (_, _) => _timeline?.NudgeSelected(+1);
+        _clipSpeedMenuItem.Click += async (_, _) => await ShowSpeedDialogAsync();
+        _createMulticamMenuItem = this.FindControl<MenuItem>("CreateMulticamMenuItem")!;
+        _createMulticamMenuItem.Click += (_, _) => CreateMulticamSource();
+        _clipNormalizeMenuItem = this.FindControl<MenuItem>("ClipNormalizeMenuItem")!;
+        _clipNormalizeMenuItem.Click += (_, _) => NormalizeSelectedClip();
+        _clipInterpretFootageMenuItem = this.FindControl<MenuItem>("ClipInterpretFootageMenuItem")!;
+        _clipInterpretFootageMenuItem.Click += (_, _) => InterpretSelectedClipFootage();
+        // Frame hold + stop-motion frame edits (PLAN.md step 43).
+        _clipFrameHoldOptionsMenuItem = this.FindControl<MenuItem>("ClipFrameHoldOptionsMenuItem")!;
+        _clipFrameHoldOptionsMenuItem.Click += async (_, _) => await ShowFrameHoldOptionsAsync();
+        _clipAddFrameHoldMenuItem = this.FindControl<MenuItem>("ClipAddFrameHoldMenuItem")!;
+        _clipAddFrameHoldMenuItem.Click += (_, _) => _timeline?.AddFrameHoldAtPlayhead();
+        _clipInsertFrameHoldSegmentMenuItem = this.FindControl<MenuItem>("ClipInsertFrameHoldSegmentMenuItem")!;
+        _clipInsertFrameHoldSegmentMenuItem.Click += (_, _) => _timeline?.InsertFrameHoldSegmentAtPlayhead();
+        _clipDuplicateFrameMenuItem = this.FindControl<MenuItem>("ClipDuplicateFrameMenuItem")!;
+        _clipDuplicateFrameMenuItem.Click += (_, _) => _timeline?.DuplicateFrameAtPlayhead();
+        _clipRemoveFrameMenuItem = this.FindControl<MenuItem>("ClipRemoveFrameMenuItem")!;
+        _clipRemoveFrameMenuItem.Click += (_, _) => _timeline?.RemoveFrameAtPlayhead();
+        this.FindControl<MenuItem>("ClipMenu")!.SubmenuOpened += (_, _) => RefreshClipMenu();
+
+        // ── Clip ▸ Insert (generators + adjustment layer, PLAN.md step 19) ──
+        var insertItems = new System.Collections.Generic.List<MenuItem>();
+        foreach (GeneratorDescriptor generator in GeneratorCatalog.BuiltIns)
+        {
+            GeneratorDescriptor g = generator; // capture per iteration
+            var item = new MenuItem { Header = g.DisplayName };
+            item.Click += (_, _) => _timeline?.InsertGenerator(g);
+            insertItems.Add(item);
+        }
+        var adjustmentItem = new MenuItem { Header = "Adjustment Layer" };
+        adjustmentItem.Click += (_, _) => _timeline?.InsertAdjustmentLayer();
+        insertItems.Add(adjustmentItem);
+        this.FindControl<MenuItem>("ClipInsertMenuItem")!.ItemsSource = insertItems;
+
+        // ── Effects (populated from the registry incl. plugins, PLAN.md steps 15–16, 33; rebuilt on open so
+        // it only offers effects relevant to the selected clip's track kind — see EffectRelevance) ──
+        var effectsMenu = this.FindControl<MenuItem>("EffectsMenu")!;
+        _effectsMenu = effectsMenu;
+        RefreshEffectsMenu();
+        effectsMenu.SubmenuOpened += (_, _) => RefreshEffectsMenu();
+
+        // ── View ──
+        this.FindControl<MenuItem>("ZoomInMenuItem")!.Click += (_, _) => _timeline?.ZoomIn();
+        this.FindControl<MenuItem>("ZoomOutMenuItem")!.Click += (_, _) => _timeline?.ZoomOut();
+        this.FindControl<MenuItem>("ZoomToFitMenuItem")!.Click += (_, _) => _timeline?.ZoomToFit();
+        _snappingMenuItem = this.FindControl<MenuItem>("SnappingMenuItem")!;
+        _guidesMenuItem = this.FindControl<MenuItem>("GuidesMenuItem")!;
+        _showProjectMenuItem = this.FindControl<MenuItem>("ShowProjectMenuItem")!;
+        _showInspectorMenuItem = this.FindControl<MenuItem>("ShowInspectorMenuItem")!;
+        // Drive the toolbar toggle (the single source of truth) from the menu checkbox's new state.
+        _snappingMenuItem.Click += (_, _) => { if (_snappingToggle is not null) _snappingToggle.IsChecked = _snappingMenuItem.IsChecked; };
+        _guidesMenuItem.Click += (_, _) => { if (_guidesToggle is not null) _guidesToggle.IsChecked = _guidesMenuItem.IsChecked; };
+        _showProjectMenuItem.Click += (_, _) => SetPanelVisible(project: true, _showProjectMenuItem.IsChecked == true);
+        _showInspectorMenuItem.Click += (_, _) => SetPanelVisible(project: false, _showInspectorMenuItem.IsChecked == true);
+        _autoScrollNoneMenuItem = this.FindControl<MenuItem>("AutoScrollNoneMenuItem")!;
+        _autoScrollPageMenuItem = this.FindControl<MenuItem>("AutoScrollPageMenuItem")!;
+        _autoScrollSmoothMenuItem = this.FindControl<MenuItem>("AutoScrollSmoothMenuItem")!;
+        _autoScrollNoneMenuItem.Click += (_, _) => SetAutoScroll(TimelineAutoScroll.None);
+        _autoScrollPageMenuItem.Click += (_, _) => SetAutoScroll(TimelineAutoScroll.Page);
+        _autoScrollSmoothMenuItem.Click += (_, _) => SetAutoScroll(TimelineAutoScroll.Smooth);
+        _showStatsMenuItem = this.FindControl<MenuItem>("ShowStatsMenuItem")!;
+        _showStatsMenuItem.Click += (_, _) => ShowStatsOverlay(_showStatsMenuItem.IsChecked == true);
+        _showProxyStatusMenuItem = this.FindControl<MenuItem>("ShowProxyStatusMenuItem")!;
+        _showProxyStatusMenuItem.IsEnabled = _proxy is not null && _project is not null;
+        _showProxyStatusMenuItem.Click += (_, _) => ShowProxyWindow(_showProxyStatusMenuItem.IsChecked == true);
+        _fullScreenMenuItem = this.FindControl<MenuItem>("FullScreenMenuItem")!;
+        _fullScreenMenuItem.Click += (_, _) => ToggleWindowFullScreen();
+        var fullScreenPreviewMenuItem = this.FindControl<MenuItem>("FullScreenPreviewMenuItem")!;
+        fullScreenPreviewMenuItem.Click += (_, _) => ToggleFullscreenPreview();
+        if (OperatingSystem.IsMacOS())
+        {
+            // The XAML gestures show the Windows/Linux keys; swap to the macOS-native chords (the labels are
+            // display-only — the accelerators live in OnKeyDown, where ⌘ is the primary modifier on macOS).
+            _fullScreenMenuItem.InputGesture = new KeyGesture(Key.F, KeyModifiers.Control | KeyModifiers.Meta);
+            fullScreenPreviewMenuItem.InputGesture = new KeyGesture(Key.F, KeyModifiers.Meta);
+
+            static KeyGesture Cmd(Key key, KeyModifiers extra = KeyModifiers.None) =>
+                new(key, KeyModifiers.Meta | extra);
+
+            this.FindControl<MenuItem>("NewMenuItem")!.InputGesture = Cmd(Key.N);
+            this.FindControl<MenuItem>("OpenMenuItem")!.InputGesture = Cmd(Key.O);
+            this.FindControl<MenuItem>("SaveMenuItem")!.InputGesture = Cmd(Key.S);
+            this.FindControl<MenuItem>("SaveAsMenuItem")!.InputGesture = Cmd(Key.S, KeyModifiers.Shift);
+            this.FindControl<MenuItem>("ImportMenuItem")!.InputGesture = Cmd(Key.I);
+            this.FindControl<MenuItem>("ExportMenuItem")!.InputGesture = Cmd(Key.E);
+            this.FindControl<MenuItem>("ExportQueueMenuItem")!.InputGesture = Cmd(Key.E, KeyModifiers.Shift);
+            // No ⌘Q here: File ▸ Exit is hidden on macOS and AppKit supplies "Quit Sprocket" ⌘Q itself.
+            _undoMenuItem!.InputGesture = Cmd(Key.Z);
+            _redoMenuItem!.InputGesture = Cmd(Key.Z, KeyModifiers.Shift);
+            _cutMenuItem.InputGesture = Cmd(Key.X);
+            _copyMenuItem.InputGesture = Cmd(Key.C);
+            _pasteMenuItem.InputGesture = Cmd(Key.V);
+            this.FindControl<MenuItem>("SelectAllMenuItem")!.InputGesture = Cmd(Key.A);
+            _clipSplitMenuItem!.InputGesture = Cmd(Key.K); // ⌘K — Split at Playhead (Shift+E's label needs no swap)
+            _linkMenuItem!.InputGesture = Cmd(Key.L);   // ⌘L toggles Link/Unlink (PLAN.md step 55) —
+            _unlinkMenuItem!.InputGesture = Cmd(Key.L); // both items show the shared shortcut
+            // Parse keeps the "," glyph — new KeyGesture(Key.OemComma, …) would render as "Cmd+OemComma".
+            this.FindControl<MenuItem>("PreferencesMenuItem")!.InputGesture = KeyGesture.Parse("Cmd+,");
+
+            // Tooltips that spell out Ctrl-based shortcuts get the same treatment.
+            ToolTip.SetTip(this.FindControl<Button>("ZoomOutButton")!, "Zoom Out (- or Cmd+-)");
+            ToolTip.SetTip(this.FindControl<Button>("ZoomInButton")!, "Zoom In (= or Cmd+=)");
+            ToolTip.SetTip(this.FindControl<Button>("MarkersButton")!,
+                "Markers panel (M adds at the playhead; Shift+M / Cmd+Shift+M navigate)");
+        }
+        this.FindControl<MenuItem>("ViewMenu")!.SubmenuOpened += (_, _) => RefreshViewMenu();
+
+        // ── Sequence (multiple sequences + nested/compound clips, PLAN.md step 23) ──
+        this.FindControl<MenuItem>("NewSequenceMenuItem")!.Click += async (_, _) => await NewSequenceAsync();
+        this.FindControl<MenuItem>("SequenceSettingsMenuItem")!.Click += async (_, _) => await ShowSequenceSettingsAsync();
+        _nestMenuItem = this.FindControl<MenuItem>("NestMenuItem")!;
+        _nestMenuItem.Click += (_, _) => NestSelection();
+        _openSequenceMenuItem = this.FindControl<MenuItem>("OpenSequenceMenuItem")!;
+        this.FindControl<MenuItem>("SequenceMenu")!.SubmenuOpened += (_, _) => RefreshSequenceMenu();
+        this.FindControl<MenuItem>("PlayInOutMenuItem")!.Click += (_, _) => PlayInToOut();
+
+        // Preview render cache commands (PLAN.md step 32).
+        this.FindControl<MenuItem>("RenderInOutMenuItem")!.Click += (_, _) =>
+            _ = RenderRangeAsync(RenderCacheScope.Video, useSelection: false);
+        _renderSelectionMenuItem = this.FindControl<MenuItem>("RenderSelectionMenuItem")!;
+        _renderSelectionMenuItem.Click += (_, _) => _ = RenderRangeAsync(RenderCacheScope.Video, useSelection: true);
+        this.FindControl<MenuItem>("RenderAudioMenuItem")!.Click += (_, _) =>
+            _ = RenderRangeAsync(RenderCacheScope.Audio, useSelection: false);
+        // Audio freeze (PLAN.md step 41): freezing is an audio render of the selected clip's range; unfreezing
+        // forgets the cached range. Both are cache operations on a derived artifact, not model edits, so they
+        // sit outside EditHistory like the other render commands (§20).
+        _freezeClipAudioMenuItem = this.FindControl<MenuItem>("FreezeClipAudioMenuItem")!;
+        _freezeClipAudioMenuItem.Click += (_, _) => _ = RenderRangeAsync(RenderCacheScope.Audio, useSelection: true);
+        _unfreezeClipAudioMenuItem = this.FindControl<MenuItem>("UnfreezeClipAudioMenuItem")!;
+        _unfreezeClipAudioMenuItem.Click += (_, _) => UnfreezeClipAudio();
+        _deleteRenderFilesMenuItem = this.FindControl<MenuItem>("DeleteRenderFilesMenuItem")!;
+        _deleteRenderFilesMenuItem.Click += (_, _) => _ = DeleteRenderFilesAsync();
+
+        // ── Window ──
+        this.FindControl<MenuItem>("ResetLayoutMenuItem")!.Click += (_, _) => ResetLayout();
+
+        // ── macOS: publish the whole menu to the system menu bar ──
+        // Everything above stays the source of truth; MacMenuBridge only mirrors it (and forwards clicks back),
+        // so the Refresh*Menu passes and every Click handler keep working. Done last, once the menu is fully
+        // wired and the ⌘ gestures above have replaced the Ctrl labels.
+        if (OperatingSystem.IsMacOS())
+        {
+            // These three belong in the macOS application menu, not the window's menus — hide them at the
+            // source (the bridge skips invisible items). MacMenuBridge re-hosts About and Preferences;
+            // quitting is left entirely to AppKit, which appends "Quit Sprocket" ⌘Q (plus Hide / Hide Others /
+            // Show All / Services) to that menu itself. Adding our own would duplicate it.
+            MenuItem aboutItem = this.FindControl<MenuItem>("AboutMenuItem")!;
+            MenuItem preferencesItem = this.FindControl<MenuItem>("PreferencesMenuItem")!;
+            aboutItem.IsVisible = false;
+            preferencesItem.IsVisible = false;
+            this.FindControl<MenuItem>("ExitMenuItem")!.IsVisible = false;
+
+            MacMenuBridge.Attach(this, this.FindControl<Menu>("MenuBar")!, aboutItem, preferencesItem);
+        }
+    }
+
+    private void OnKeyDown(object? sender, KeyEventArgs e)
+    {
+        bool ctrl = e.KeyModifiers.HasFlag(KeyModifiers.Control);
+        bool shift = e.KeyModifiers.HasFlag(KeyModifiers.Shift);
+        bool alt = e.KeyModifiers.HasFlag(KeyModifiers.Alt);
+        bool meta = e.KeyModifiers.HasFlag(KeyModifiers.Meta);
+        bool isMac = OperatingSystem.IsMacOS();
+        // The platform's primary shortcut modifier: ⌘ on macOS (Ctrl deliberately does NOT alias it there —
+        // the convention in leading editors), Ctrl on Windows/Linux.
+        bool primary = isMac ? meta : ctrl;
+
+        // ── Global accelerators (work regardless of focus) ──
+        // Window fullscreen: F11 everywhere, plus the native ⌃⌘F on macOS (Magic Keyboards without an Fn row
+        // treat F11 as a media key, so F11 alone is unreachable there). While the fullscreen preview overlay is
+        // up, F11 peels that first — an overlay in a windowed frame isn't this feature's contract.
+        if (e.Key == Key.F11 || (isMac && ctrl && meta && e.Key == Key.F))
+        {
+            if (_previewFullscreen)
+                ExitFullscreenPreview();
+            else
+                ToggleWindowFullScreen();
+            e.Handled = true;
+            return;
+        }
+        // Full-screen preview: Ctrl+F (⌘F on macOS) — the full-screen viewer convention in leading editors. ⌃⌘F returned above.
+        if (primary && e.Key == Key.F)
+        {
+            ToggleFullscreenPreview();
+            e.Handled = true;
+            return;
+        }
+        // Quit: Ctrl+Q on Linux (the GNOME/freedesktop convention, matching the File ▸ Quit label).
+        // Windows uses Alt+F4, serviced by the window manager. macOS is deliberately absent — AppKit's
+        // "Quit Sprocket" ⌘Q in the application menu owns that chord, and handling it here as well would
+        // give the platform two different ways out of the app.
+        if (OperatingSystem.IsLinux() && ctrl && e.Key == Key.Q) { Close(); e.Handled = true; return; }
+        if (primary && e.Key == Key.N) { NewProject(); e.Handled = true; return; }
+        if (primary && e.Key == Key.O) { _ = OpenProjectAsync(); e.Handled = true; return; }
+        if (primary && shift && e.Key == Key.S) { _ = SaveAsAsync(); e.Handled = true; return; }
+        if (primary && e.Key == Key.S) { Save(); e.Handled = true; return; }
+        if (primary && shift && e.Key == Key.E) { OpenExportQueue(); e.Handled = true; return; }
+        if (primary && e.Key == Key.E) { _ = ExportAsync(); e.Handled = true; return; }
+        if (primary && e.Key == Key.I) { _ = ImportDialogAsync(); e.Handled = true; return; }
+        if (primary && e.Key == Key.OemComma) { _ = ShowPreferencesAsync(); e.Handled = true; return; }
+        if (primary && shift && e.Key == Key.Z) { _history.Redo(); e.Handled = true; return; }
+        if (primary && e.Key == Key.Z) { _history.Undo(); e.Handled = true; return; }
+        // Ctrl+Y redo is the Windows/Linux alias only; macOS redo is ⌘⇧Z alone.
+        if (!isMac && ctrl && e.Key == Key.Y) { _history.Redo(); e.Handled = true; return; }
+        // Jump to the previous marker (Ctrl+Shift+M, the convention in leading editors). Add (M) / next (Shift+M) are below the text guard.
+        if (primary && shift && e.Key == Key.M) { JumpToMarker(-1); e.Handled = true; return; }
+        // Timeline zoom, the FCP/Resolve half of the convention (the bare -/= keys used by Premiere/After Effects
+        // are below, with Shift+Z "zoom to fit"). Ctrl++/Ctrl+- are safe with a focused text field so they stay
+        // above the guard. OemPlus/OemMinus are the main-row =/- keys; Add/Subtract are the numpad equivalents.
+        if (primary && (e.Key == Key.OemPlus || e.Key == Key.Add)) { _timeline?.ZoomIn(); e.Handled = true; return; }
+        if (primary && (e.Key == Key.OemMinus || e.Key == Key.Subtract)) { _timeline?.ZoomOut(); e.Handled = true; return; }
+
+        // Below here are transport / editing keys that must not steal input from a focused text field
+        // (the media-bin search box, the Inspector numeric boxes).
+        if (IsTypingInTextBox())
+            return;
+
+        if (primary && e.Key == Key.X) { _timeline?.CutSelected(); e.Handled = true; }
+        else if (primary && e.Key == Key.C) { _timeline?.CopySelected(); e.Handled = true; }
+        else if (primary && e.Key == Key.V) { _timeline?.PasteAtPlayhead(); e.Handled = true; }
+        // Select All (PLAN.md step 54) — below the text guard so a focused text box keeps its native Ctrl+A.
+        else if (primary && e.Key == Key.A) { _timeline?.SelectAll(); e.Handled = true; }
+        // Split at Playhead (Ctrl+K / ⌘K — the Add Edit command in leading editors) and the Enable toggle (Shift+E,
+        // the convention in leading editors), PLAN.md step 53. Ctrl+Shift+E (Export Queue) is handled above the text guard.
+        else if (primary && e.Key == Key.K) { _timeline?.SplitAtPlayhead(); e.Handled = true; }
+        // Link/Unlink toggle (Ctrl+L / ⌘L, the shortcut used by leading editors — PLAN.md step 55): links an
+        // eligible multi-selection, otherwise unlinks the selected clip's group.
+        else if (primary && e.Key == Key.L) { _timeline?.ToggleLinkSelected(); e.Handled = true; }
+        else if (shift && !primary && !alt && e.Key == Key.E) { _timeline?.ToggleSelectedEnabled(); e.Handled = true; }
+        else if (shift && (e.Key == Key.Delete || e.Key == Key.Back)) { _timeline?.RippleDeleteSelected(); e.Handled = true; }
+        else if (e.Key == Key.Delete || e.Key == Key.Back) { _timeline?.DeleteSelected(); e.Handled = true; }
+        else if (alt && e.Key == Key.Left) { _timeline?.NudgeSelected(-1); e.Handled = true; }
+        else if (alt && e.Key == Key.Right) { _timeline?.NudgeSelected(+1); e.Handled = true; }
+        // Activate a work area directly (Shift+1 Project, Shift+2 Timeline, Shift+3 Monitor, Shift+4 Inspector —
+        // the Premiere-style "activate panel by number" convention, see WorkAreaFocus.TryDirectKey). Sits above
+        // the bare 1–9 multicam angle keys, which are gated on !shift so the two never collide, and below the
+        // text guard so Shift+1 still types "!" in a field.
+        else if (shift && !primary && !ctrl && !alt && WorkAreaFocus.TryDirectKey(e.Key, out WorkArea directArea))
+        {
+            e.Handled = FocusWorkArea(directArea);
+        }
+        // Multicam angle switching (PLAN.md step 24): 1–9 cut the selected multicam clip to that angle at the
+        // playhead — the convention in leading editors. Only swallow the digit when a multicam clip is selected.
+        else if (!primary && !ctrl && !alt && !shift && TryAngleKey(e.Key, out int angle) && _timeline?.SelectedIsMulticam == true)
+        {
+            _timeline.SwitchSelectedAngle(angle);
+            e.Handled = true;
+        }
+        // Jump-to-previous/next-keyframe of the selected clip (leading editors use [ / ], step 16d).
+        else if (e.Key == Key.OemOpenBrackets) { JumpToKeyframe(-1); e.Handled = true; }
+        else if (e.Key == Key.OemCloseBrackets) { JumpToKeyframe(+1); e.Handled = true; }
+        // Markers (PLAN.md step 20): add at the playhead (M), jump to the next (Shift+M; previous is Ctrl+Shift+M).
+        else if (shift && e.Key == Key.M) { JumpToMarker(+1); e.Handled = true; }
+        else if (e.Key == Key.M) { AddMarker(); e.Handled = true; }
+        else if (shift && e.Key == Key.Z) { _timeline?.ZoomToFit(); e.Handled = true; }
+        // Timeline zoom on the bare -/= keys (the Premiere / After Effects / Shotcut / Kdenlive convention; the
+        // Ctrl+± aliases above the text guard are the FCP / Resolve one). Shift is tolerated so the shifted "+"
+        // glyph zooms in as well as "="; OemPlus/OemMinus are the main-row keys, Add/Subtract the numpad ones.
+        // Deliberate departure from Premiere: these zoom the timeline globally rather than the focused panel,
+        // matching how Shift+Z / Space / M / I / O already behave in this handler. They sit below the text guard
+        // so a focused search or numeric field still types "-" and "=" literally.
+        else if (!primary && !ctrl && !alt && (e.Key == Key.OemMinus || e.Key == Key.Subtract))
+        {
+            _timeline?.ZoomOut();
+            e.Handled = true;
+        }
+        else if (!primary && !ctrl && !alt && (e.Key == Key.OemPlus || e.Key == Key.Add))
+        {
+            _timeline?.ZoomIn();
+            e.Handled = true;
+        }
+        // Timeline in/out marks (PLAN.md step 32): I / O set at the playhead (the leading NLEs convention), Alt+I /
+        // Alt+O clear. Ctrl+I (Import) and Ctrl+O (Open) are handled above the text guard and never reach here.
+        else if (alt && e.Key == Key.I) { ClearMark(inPoint: true); e.Handled = true; }
+        else if (alt && e.Key == Key.O) { ClearMark(inPoint: false); e.Handled = true; }
+        else if (e.Key == Key.I) { SetMarkAtPlayhead(inPoint: true); e.Handled = true; }
+        else if (e.Key == Key.O) { SetMarkAtPlayhead(inPoint: false); e.Handled = true; }
+        // Play In to Out (Ctrl+Shift+Space / ⌘⇧Space, the Premiere convention): plays only the marked range of the
+        // Program monitor. Sits above plain Space, which stays unconstrained by the marks.
+        else if (primary && shift && e.Key == Key.Space) { if (!_exporting) PlayInToOut(); e.Handled = true; }
+        else if (e.Key == Key.Space) { if (!_exporting) _active?.TogglePlayPause(); e.Handled = true; }
+        // Esc peels fullscreen modes one layer at a time: the preview overlay first, then window fullscreen
+        // (unless the preview itself entered fullscreen, in which case exiting it restores everything at once).
+        // Sits below the text-box guard so the rename/title editors' own Escape handling wins.
+        else if (e.Key == Key.Escape)
+        {
+            if (_previewFullscreen) { ExitFullscreenPreview(); e.Handled = true; }
+            else if (WindowState == WindowState.FullScreen) { ToggleWindowFullScreen(); e.Handled = true; }
+        }
+    }
+
+    /// <summary>
+    /// Edit ▸ Preferences (PLAN.md step 38): shows the user-scoped settings dialog and applies the result —
+    /// persists to disk, rebuilds the autosave timer if its interval changed, and hands the MCP fields to the
+    /// app-scoped server controller (which starts/stops/restarts the loopback listener as needed).
+    /// </summary>
+    private async Task ShowPreferencesAsync()
+    {
+        UserSettings? updated = await PreferencesDialog.Show(this, _userSettings,
+            proxyCacheSize: Proxy.ProxyCache.SizeBytes,
+            // Route through the service so its per-asset state (and the Proxy window showing it) can't be left
+            // claiming a Ready proxy whose file has just been deleted underneath it. Only a session with no project
+            // falls back to the bare cache sweep.
+            clearProxyCache: () => _proxy is { } proxy ? proxy.DeleteAllProxies() : Proxy.ProxyCache.DeleteAll(),
+            renderCacheSize: () => _renderCache?.SizeBytes() ?? 0,
+            clearRenderCache: () => _renderCache?.DeleteAll(),
+            audioDevices: Sprocket.Audio.OpenAlAudioOutput.EnumerateOutputDevices());
+        if (updated is null)
+            return;
+
+        bool autosaveChanged = updated.AutosaveIntervalSeconds != _userSettings.AutosaveIntervalSeconds;
+        bool updatePolicyChanged = updated.UpdateCheckEnabled != _userSettings.UpdateCheckEnabled;
+        bool audioDeviceChanged = !string.Equals(updated.AudioOutputDevice, _userSettings.AudioOutputDevice, StringComparison.Ordinal);
+        _userSettings = updated;
+        UserSettingsFile.Save(updated);
+
+        // Repoint the live master clock at the newly chosen device in place — seamless, no session rebuild, the
+        // playhead is kept (AudioEngine.SwitchOutputDevice). With no audio clock (a project with no audio, or the
+        // software-clock fallback) the choice just persists and takes effect the next time a session opens audio.
+        if (audioDeviceChanged && _audioClock is { } audioClock)
+        {
+            bool switched = audioClock.SwitchOutputDevice(updated.AudioOutputDevice);
+            SetStatus(switched
+                ? (updated.AudioOutputDevice.Length == 0 ? "Audio output: System Default" : $"Audio output: {updated.AudioOutputDevice}")
+                : "Could not switch the audio output device — keeping the current one.");
+        }
+
+        // A changed update setting takes effect now, not next launch: re-check when just enabled,
+        // or clear the badge when checks were just switched off.
+        if (updatePolicyChanged && _updateService is { } updateService)
+            _ = updateService.CheckAsync(updated, force: updated.UpdateCheckEnabled);
+
+        if (autosaveChanged && _project is not null)
+        {
+            _autosave?.Dispose();
+            _autosave = new AutosaveService(_project, _history, () => _currentProjectPath,
+                TimeSpan.FromSeconds(updated.AutosaveIntervalSeconds));
+        }
+
+        if (_mcpService is { } mcpService)
+        {
+            await mcpService.ApplyAsync(updated);
+            if (mcpService.State == McpServerService.McpState.Error)
+                await MessageDialog.Show(this, "MCP Server",
+                    mcpService.LastError ?? "The MCP server failed to start.");
+        }
+    }
+
+    /// <summary>
+    /// Edit ▸ Plugins… (PLAN.md step 58): opens the Plugin Manager over the process-wide
+    /// <see cref="PluginService"/> host. Modal (like Preferences), so nothing else can save settings while its
+    /// enable/disable toggles rewrite the disabled-plugin list; on close the in-memory <see cref="_userSettings"/>
+    /// is re-synced with the list the manager just persisted, so a later settings save can't clobber it. Enable /
+    /// disable / install / uninstall re-register or drop effects live, so the preview is repainted to reflect them.
+    /// </summary>
+    private async Task ShowPluginManagerAsync()
+    {
+        if (PluginService.Manager is not { } manager)
+        {
+            await MessageDialog.Show(this, "Plugins", "The plugin host is not available in this session.");
+            return;
+        }
+
+        var window = new PluginManagerWindow(manager, onChanged: () => _preview?.InvalidateVisual());
+        await window.ShowDialog(this);
+
+        // Keep the in-memory settings copy in step with the list the manager persisted, so the next
+        // UserSettingsFile.Save (e.g. from Preferences) preserves the user's enable/disable choices.
+        _userSettings = _userSettings with { DisabledPlugins = manager.DisabledPaths };
+    }
+
+    private bool IsTypingInTextBox() => FocusedElement() is TextBox;
+
+    private IInputElement? FocusedElement() =>
+        TopLevel.GetTopLevel(this)?.FocusManager?.GetFocusedElement();
+
+    // ── Work-area focus ring (Tab / Shift+Tab, Shift+1–4) ───────────────────────────────────────────
+
+    /// <summary>
+    /// Installs the coarse work-area focus model (<see cref="WorkAreaFocus"/>): plain <c>Tab</c> /
+    /// <c>Shift+Tab</c> step between the Project / Monitor / Timeline / Inspector panes instead of crawling
+    /// every focusable widget in the shell, which is how panels are activated in leading NLEs.
+    /// <para>
+    /// The handler goes on <c>ShellRoot</c>, not on the window: Avalonia's own
+    /// <c>KeyboardNavigationHandler</c> is registered as an instance <c>KeyDown</c> handler on the
+    /// <see cref="TopLevel"/> itself, so a window-level handler would only run after focus had already moved.
+    /// <c>ShellRoot</c> is nearer the focused control in the bubble route, so it sees the key first and
+    /// marking it handled keeps native traversal out.
+    /// </para>
+    /// </summary>
+    private void WireWorkAreaFocus()
+    {
+        _shellRoot = this.FindControl<Panel>("ShellRoot");
+        _monitorPane = this.FindControl<Border>("MonitorPane");
+        _timelinePane = this.FindControl<Border>("TimelinePane");
+
+        // Each area's representative focus target is the panel root, never a control inside it: focusing a
+        // text field (the bin's search box, an Inspector value) would immediately hand Tab back to native
+        // traversal. These are resolved from the XAML rather than the wired fields so the ring also works in
+        // a session with no engine, where WireTransport / WireTimeline never run.
+        _projectAreaTarget = this.FindControl<MediaBrowserPanel>("MediaBrowser");
+        _monitorAreaTarget = this.FindControl<PreviewSurface>("Preview");
+        _timelineAreaTarget = this.FindControl<TimelineControl>("Timeline");
+        _inspectorAreaTarget = this.FindControl<InspectorPanel>("Inspector");
+        foreach (Control? target in new[] { _projectAreaTarget, _monitorAreaTarget, _timelineAreaTarget, _inspectorAreaTarget })
+        {
+            if (target is null)
+                continue;
+            // Focusable so the ring can park focus on them (the timeline already was), but deliberately not
+            // native tab stops: the areas are reached through the ring, and native traversal — which now only
+            // runs out of a focused text field — should keep landing on real widgets, not on a panel root
+            // that has no focus adorner of its own.
+            target.Focusable = true;
+            target.IsTabStop = false;
+        }
+
+        if (_shellRoot is not null)
+        {
+            _shellRoot.AddHandler(KeyDownEvent, OnShellKeyDown);
+            _shellRoot.AddHandler(GotFocusEvent, OnShellGotFocus);
+        }
+        UpdateActiveAreaAffordance();
+
+        // Park focus in the default work area (the timeline) once the shell is up. Two reasons: the accent edge
+        // shouldn't claim an area nothing is focused in, and a key event with no focused element is raised on the
+        // window rather than routed up through ShellRoot — so the first Tab would miss the handler above.
+        Opened += (_, _) =>
+        {
+            FocusWorkArea(_activeArea);
+            _ = MaybeOfferLinuxDesktopIntegrationAsync();
+        };
+    }
+
+    /// <summary>
+    /// Turns plain <c>Tab</c> / <c>Shift+Tab</c> into a work-area step. Deliberately narrow: modified Tab
+    /// chords, menus/popups (their own visual root), and a focused lone text field are all left to their
+    /// native behavior, and a focused field inside a form-like group (an Inspector section card) traverses
+    /// that group's fields first — only running off the group's edge escalates to the ring.
+    /// </summary>
+    private void OnShellKeyDown(object? sender, KeyEventArgs e)
+    {
+        if (e.Handled || e.Key != Key.Tab)
+            return;
+        // Only the unmodified chords drive the ring; Ctrl/Alt/⌘+Tab stay with the OS and the window manager.
+        if (e.KeyModifiers is not (KeyModifiers.None or KeyModifiers.Shift))
+            return;
+
+        bool forward = !e.KeyModifiers.HasFlag(KeyModifiers.Shift);
+        IInputElement? focused = FocusedElement();
+
+        // A menu drop-down / combo popup / context menu lives in its own visual root (a PopupRoot is itself a
+        // TopLevel) and keeps its own traversal. Modal dialogs are separate windows and never reach this
+        // handler at all.
+        if (focused is Control focusedControl && !ReferenceEquals(TopLevel.GetTopLevel(focusedControl), this))
+            return;
+
+        if (focused is Control control && NearestFieldGroup(control) is { } group)
+        {
+            List<Control> stops = FieldGroupStops(group);
+            int index = stops.IndexOf(control);
+            int nextIndex = index + (forward ? 1 : -1);
+            if (index >= 0 && nextIndex >= 0 && nextIndex < stops.Count)
+            {
+                stops[nextIndex].Focus(NavigationMethod.Tab);
+                e.Handled = true;
+                return;
+            }
+            // Off the group's first/last field → the ring takes over below.
+        }
+        else if (focused is TextBox)
+        {
+            // Never hijack Tab while typing in a standalone field (the bin search box, the inline track-rename
+            // and title editors): a lone field has no group to traverse, so native navigation stands.
+            return;
+        }
+
+        if (FocusWorkArea(WorkAreaFocus.Advance(_activeArea, forward, IsWorkAreaAvailable)))
+            e.Handled = true;
+    }
+
+    /// <summary>
+    /// Keeps <see cref="_activeArea"/> honest when focus moves by any other means — a click in a pane, a
+    /// dialog closing back onto the timeline, native traversal out of a text field. Focus landing on shell
+    /// chrome (toolbar, transport, status bar, title bar) belongs to no area and leaves the active one alone.
+    /// </summary>
+    private void OnShellGotFocus(object? sender, FocusChangedEventArgs e)
+    {
+        if (e.Source is Control control && AreaOf(control) is { } area)
+            SetActiveArea(area);
+    }
+
+    /// <summary>
+    /// Makes <paramref name="area"/> the active work area and moves keyboard focus to its representative
+    /// control. Returns <see langword="false"/> (and changes nothing) when the area is unavailable — a hidden
+    /// pane, or a shell that never built that control.
+    /// </summary>
+    private bool FocusWorkArea(WorkArea? area)
+    {
+        if (area is not { } target || !IsWorkAreaAvailable(target) || TargetFor(target) is not { } control)
+            return false;
+        SetActiveArea(target);
+        control.Focus(NavigationMethod.Tab);
+        return true;
+    }
+
+    private void SetActiveArea(WorkArea area)
+    {
+        if (_activeArea == area)
+            return;
+        _activeArea = area;
+        UpdateActiveAreaAffordance();
+    }
+
+    /// <summary>Whether the ring should stop on <paramref name="area"/>: its pane is on screen and built.</summary>
+    private bool IsWorkAreaAvailable(WorkArea area)
+    {
+        // While the full-screen preview overlay is up, the picture is the only work area on screen.
+        if (_previewFullscreen)
+            return area == WorkArea.Monitor && _monitorAreaTarget is not null;
+
+        return area switch
+        {
+            WorkArea.Project => _projectAreaTarget is not null && _projectPane?.IsVisible != false,
+            WorkArea.Monitor => _monitorAreaTarget is not null,
+            WorkArea.Timeline => _timelineAreaTarget is not null,
+            WorkArea.Inspector => _inspectorAreaTarget is not null && _inspectorPane?.IsVisible != false,
+            _ => false,
+        };
+    }
+
+    private Control? TargetFor(WorkArea area) => area switch
+    {
+        WorkArea.Project => _projectAreaTarget,
+        WorkArea.Monitor => _monitorAreaTarget,
+        WorkArea.Timeline => _timelineAreaTarget,
+        WorkArea.Inspector => _inspectorAreaTarget,
+        _ => null,
+    };
+
+    private Border? PaneFor(WorkArea area) => area switch
+    {
+        WorkArea.Project => _projectPane,
+        WorkArea.Monitor => _monitorPane,
+        WorkArea.Timeline => _timelinePane,
+        WorkArea.Inspector => _inspectorPane,
+        _ => null,
+    };
+
+    /// <summary>The work area <paramref name="control"/> sits in, or <see langword="null"/> for shell chrome.</summary>
+    private WorkArea? AreaOf(Control control)
+    {
+        foreach (WorkArea area in WorkAreaFocus.Ring)
+        {
+            if (PaneFor(area) is { } pane && IsInside(control, pane))
+                return area;
+        }
+        return null;
+    }
+
+    /// <summary>Paints the accent pane edge on the active area and clears it everywhere else.</summary>
+    private void UpdateActiveAreaAffordance()
+    {
+        foreach (WorkArea area in WorkAreaFocus.Ring)
+        {
+            if (PaneFor(area) is not { } pane)
+                continue;
+            bool active = area == _activeArea;
+            if (active && !pane.Classes.Contains(WorkAreaFocus.ActiveAreaClass))
+                pane.Classes.Add(WorkAreaFocus.ActiveAreaClass);
+            else if (!active)
+                pane.Classes.Remove(WorkAreaFocus.ActiveAreaClass);
+        }
+    }
+
+    /// <summary>
+    /// The nearest ancestor (or <paramref name="control"/> itself) marked
+    /// <see cref="WorkAreaFocus.FieldGroupClass"/> — the form-like grouping whose fields keep local Tab
+    /// traversal. Null when the control is not in one.
+    /// </summary>
+    private static Control? NearestFieldGroup(Control control)
+    {
+        for (Visual? v = control; v is not null; v = v.GetVisualParent())
+        {
+            if (v is Control c && c.Classes.Contains(WorkAreaFocus.FieldGroupClass))
+                return c;
+        }
+        return null;
+    }
+
+    private static bool IsInside(Visual control, Visual container) =>
+        ReferenceEquals(control, container) || control.GetVisualAncestors().Contains(container);
+
+    /// <summary>
+    /// A field group's own tab stops in visual order — the list plain Tab walks before escalating to the work-area
+    /// ring. Visual order rather than <c>TabIndex</c> order because nothing in the Inspector assigns a TabIndex;
+    /// a collapsed section's content is not effectively visible, so it contributes no stops.
+    /// </summary>
+    private static List<Control> FieldGroupStops(Control group) =>
+        group.GetVisualDescendants()
+            .OfType<Control>()
+            .Where(c => c is { Focusable: true, IsTabStop: true, IsEffectivelyEnabled: true, IsEffectivelyVisible: true })
+            .ToList();
+
+    /// <summary>Maps a 1–9 number-row or numpad key to a zero-based multicam angle index (PLAN.md step 24).</summary>
+    private static bool TryAngleKey(Key key, out int angle)
+    {
+        if (key >= Key.D1 && key <= Key.D9) { angle = key - Key.D1; return true; }
+        if (key >= Key.NumPad1 && key <= Key.NumPad9) { angle = key - Key.NumPad1; return true; }
+        angle = 0;
+        return false;
+    }
+
+    /// <summary>
+    /// Seeks the playhead to the previous (<paramref name="direction"/> &lt; 0) or next keyframe of the selected
+    /// clip, across all its animated parameters (PLAN.md step 16d). A no-op when there is no selection or no
+    /// keyframe in that direction. Keyframe times are absolute timeline times, so this drives the Program
+    /// monitor (the timeline), regardless of which monitor is active.
+    /// </summary>
+    private void JumpToKeyframe(int direction)
+    {
+        if (_selectedClip is not { } clip || _program is null)
+            return;
+        Timecode now = _program.Position;
+        Timecode? target = direction < 0
+            ? KeyframeNavigation.PreviousKeyframe(clip, now)
+            : KeyframeNavigation.NextKeyframe(clip, now);
+        if (target is { } t)
+            _program.SeekTo(t);
+    }
+
+    /// <summary>Adds a sequence marker at the playhead (PLAN.md step 20) and reports it on the status strip.</summary>
+    private void AddMarker()
+    {
+        if (_timeline?.AddMarkerAtPlayhead() is { } marker)
+            SetStatus($"Marker added at {FormatTime(marker.Time)}");
+    }
+
+    /// <summary>
+    /// Seeks the Program playhead to the previous (<paramref name="direction"/> &lt; 0) or next sequence marker
+    /// (PLAN.md step 20), mirroring the keyframe navigation. A no-op when there is no marker in that direction.
+    /// </summary>
+    private void JumpToMarker(int direction)
+    {
+        if (_project is null || _program is null)
+            return;
+        Timecode now = _program.Position;
+        Marker? target = direction < 0
+            ? MarkerNavigation.Previous(_project.Timeline.Markers, now)
+            : MarkerNavigation.Next(_project.Timeline.Markers, now);
+        if (target is { } m)
+        {
+            _program.SeekTo(m.Time);
+            SetStatus(MarkerListFormat.Describe(m, _project.Timeline.Markers.IndexOf(m)));
+        }
+    }
+
+    /// <summary>Enables the keyframe-jump buttons only when the selection has keyframes to navigate.</summary>
+    private void RefreshKeyframeNav()
+    {
+        bool has = _selectedClip is { } clip && KeyframeNavigation.HasKeyframes(clip);
+        if (_prevKeyframeButton is not null)
+            _prevKeyframeButton.IsEnabled = has;
+        if (_nextKeyframeButton is not null)
+            _nextKeyframeButton.IsEnabled = has;
+    }
+
+    // ── Project chrome: title, media bin, sequence badge, telemetry ─────────────────────────────────
+
+    private void PopulateProjectChrome(string status)
+    {
+        SetStatus(status);
+
+        if (_project is null)
+            return;
+
+        if (_currentProjectPath is not null)
+            _projectName = ProjectDisplayName(_currentProjectPath);
+        else
+        {
+            string? mediaPath = _project.MediaPool.Items.FirstOrDefault()?.AbsolutePath;
+            _projectName = mediaPath is null ? "Untitled" : Path.GetFileNameWithoutExtension(mediaPath);
+        }
+        UpdateProjectTitle();
+        UpdateSequenceBadge();
+        UpdateTelemetry();
+        UpdateTimelineHeader();
+    }
+
+    private void UpdateProjectTitle() => this.FindControl<TextBlock>("ProjectTitleText")!.Text = _projectName;
+
+    /// <summary>The sequence badge: the active sequence's name and render format (PLAN.md step 23). With one
+    /// sequence it reads like the pre-step-23 badge plus the name.</summary>
+    private void UpdateSequenceBadge()
+    {
+        if (_project is null)
+            return;
+        Timeline timeline = _project.Timeline;
+        double fps = Fps(timeline.FrameRate);
+        (int w, int h) = (timeline.Resolution.Width, timeline.Resolution.Height);
+        string resLabel = h switch { 2160 => "4K", 1080 => "1080p", 720 => "720p", _ => $"{w}×{h}" };
+        this.FindControl<TextBlock>("SequenceBadge")!.Text = $"{_project.ActiveSequence.Name} · {resLabel} · {fps:0.##}";
+    }
+
+    /// <summary>The status-bar telemetry at rest: the sequence's <em>nominal</em> rate · resolution · duration
+    /// (UI.md §3.7). Called on session/sequence changes and when playback stops; during playback the timer feeds
+    /// <see cref="RenderTelemetry"/> the measured rate instead.</summary>
+    private void UpdateTelemetry()
+    {
+        if (_project is null)
+            return;
+        RenderTelemetry(Fps(_project.Timeline.FrameRate));
+    }
+
+    /// <summary>Renders the right-hand telemetry cell as <c>fps · WxH · duration</c> for a given frame rate (nominal
+    /// at rest, measured while playing). Only assigns when the string changes, so a steady readout never re-lays-out
+    /// the status bar. No framework/runtime text (UI.md §3.7).</summary>
+    private void RenderTelemetry(double fps)
+    {
+        if (_project is null)
+            return;
+        Timeline timeline = _project.Timeline;
+        (int w, int h) = (timeline.Resolution.Width, timeline.Resolution.Height);
+        Timecode duration = _engine?.Duration ?? timeline.Duration;
+        string text = StatusBarFormat.Telemetry(fps, w, h, FormatTime(duration));
+        if (_telemetryText!.Text != text)
+            _telemetryText.Text = text;
+    }
+
+    /// <summary>
+    /// Updates the left status group — the state dot + <c>State · GPU/CPU · device</c> (UI.md §3.7). The GPU /
+    /// hardware-accel status is the top-most decoding layer at the playhead; nothing decoding (a gap / generator)
+    /// shows just the state word. Reads a cached managed snapshot (<see cref="PlaybackEngine.GetActiveVideoDecodeInfo"/>),
+    /// never native decoder state, so it is cheap and UI-thread-safe. Assigns only on change to avoid needless layout.
+    /// </summary>
+    private void UpdateEngineStatus()
+    {
+        PlaybackEngine? engine = _active?.CurrentEngine ?? _engine;
+        PlaybackState state = _active?.State ?? engine?.State ?? PlaybackState.Stopped;
+        bool playing = state == PlaybackState.Playing;
+        Media.VideoDecodeInfo? decode = engine?.GetActiveVideoDecodeInfo();
+
+        string label = StatusBarFormat.EngineLabel(state, decode);
+
+        // Idle/paused = neutral dot; playing = green, or amber on the software (CPU) path — the usual 1080p
+        // stutter cause, worth flagging the same way the Playback Statistics overlay does.
+        IBrush dot = !playing ? Palette.MutedTextBrush
+            : decode is { IsHardwareAccelerated: false } ? Palette.WarnBrush
+            : Palette.GoodBrush;
+
+        if (_engineStateText!.Text != label)
+            _engineStateText.Text = label;
+        if (_stateDot is not null && !ReferenceEquals(_stateDot.Fill, dot))
+            _stateDot.Fill = dot;
+    }
+
+    /// <summary>The status-bar MCP indicator (PLAN.md step 38): hidden while off; green dot + "MCP :port"
+    /// while listening; red dot + the bind error as tooltip when the toggle is on but the port won't bind.</summary>
+    private void UpdateMcpStatus()
+    {
+        if (_mcpStatusPanel is null || _mcpService is null)
+            return;
+        switch (_mcpService.State)
+        {
+            case McpServerService.McpState.Listening:
+                _mcpStatusPanel.IsVisible = true;
+                if (_mcpDot is not null) _mcpDot.Fill = Palette.GoodBrush;
+                if (_mcpLabel is not null) _mcpLabel.Text = $"MCP :{_mcpService.Port}";
+                ToolTip.SetTip(_mcpStatusPanel, "AI control (MCP) is enabled — a local client can inspect and edit this project.");
+                break;
+            case McpServerService.McpState.Error:
+                _mcpStatusPanel.IsVisible = true;
+                if (_mcpDot is not null) _mcpDot.Fill = Palette.BadBrush;
+                if (_mcpLabel is not null) _mcpLabel.Text = "MCP error";
+                ToolTip.SetTip(_mcpStatusPanel, _mcpService.LastError);
+                break;
+            default:
+                _mcpStatusPanel.IsVisible = false;
+                break;
+        }
+    }
+
+    /// <summary>Opens <paramref name="uri"/> in the default browser (best-effort, like About's
+    /// Open Logs Folder — a missing launcher must not crash).</summary>
+    private async Task OpenUriAsync(string uri)
+    {
+        try
+        {
+            if (GetTopLevel(this)?.Launcher is { } launcher)
+                await launcher.LaunchUriAsync(new Uri(uri));
+        }
+        catch
+        {
+        }
+    }
+
+    /// <summary>The non-modal update affordances (PLAN.md steps 36 + 45, refined): the status-bar badge, the
+    /// Help-menu discoverability dot, and the one-time first-run toast. All hang off the app-scoped checker's
+    /// result; deliberately non-modal — nothing interrupts editing. The badge/dot deepen colour the longer a
+    /// known update stays uninstalled (age-based escalation), and the toast fires once per version.</summary>
+    private void RefreshUpdateAffordances()
+    {
+        string? version = _updateService?.AvailableVersion;
+        // The no-nagging rule: suppress everything for exactly the version the user chose to skip.
+        bool show = version is not null &&
+            !string.Equals(version, _userSettings.UpdateDismissedTag, StringComparison.Ordinal);
+
+        // Stamp when this version was first seen so the escalation clock starts (persist only on change, so
+        // this isn't a write on every StateChanged). A newer version resets the clock and re-arms the toast.
+        if (show && !string.Equals(version, _userSettings.UpdateFirstSeenVersion, StringComparison.Ordinal))
+        {
+            _userSettings = _userSettings with
+            {
+                UpdateFirstSeenVersion = version!,
+                UpdateFirstSeenUtc = UpdateEscalation.Format(DateTimeOffset.UtcNow),
+            };
+            UserSettingsFile.Save(_userSettings);
+        }
+
+        UpdateTier tier = show
+            ? UpdateEscalation.TierFor(_userSettings.UpdateFirstSeenUtc, DateTimeOffset.UtcNow)
+            : UpdateTier.Fresh;
+        IBrush dotBrush = tier switch
+        {
+            UpdateTier.Stale => Palette.WarnBrush,
+            UpdateTier.Aging => Palette.AccentBrush,
+            _ => Palette.MutedTextBrush,
+        };
+
+        if (_updateBadge is not null)
+            _updateBadge.IsVisible = show;
+        if (show)
+        {
+            if (_updateBadgeDot is not null)
+                _updateBadgeDot.Fill = dotBrush;
+            if (_updateBadgeLabel is not null)
+                _updateBadgeLabel.Text = tier == UpdateTier.Stale ? "Update recommended" : $"Update {version}";
+        }
+
+        // Help-menu discoverability dot (+ the in-menu Check-for-Updates dot), same show flag + tier colour.
+        foreach (Ellipse? menuDot in new[] { _helpMenuUpdateDot, _checkUpdatesMenuDot })
+        {
+            if (menuDot is null)
+                continue;
+            menuDot.IsVisible = show;
+            menuDot.Fill = dotBrush;
+        }
+
+        // First-run toast: once per version, gated by the persisted tag so future launches stay quiet.
+        if (show && UpdateEscalation.ShouldToast(version, _userSettings.UpdateToastShownTag,
+                _userSettings.UpdateDismissedTag, _updateService?.IsInstalled == true))
+        {
+            _userSettings = _userSettings with { UpdateToastShownTag = version! };
+            UserSettingsFile.Save(_userSettings);
+            ShowUpdateToast(version!);
+        }
+        else if (!show)
+        {
+            HideUpdateToast();
+        }
+    }
+
+    /// <summary>Shows the first-run toast and arms its ~9 s auto-dismiss. Non-modal; it always collapses to
+    /// the still-present status-bar badge.</summary>
+    private void ShowUpdateToast(string version)
+    {
+        if (_updateToast is null)
+            return;
+        if (_updateToastText is not null)
+            _updateToastText.Text = $"DaVinci Project {version} is available.";
+        _updateToast.IsVisible = true;
+        _updateToastTimer ??= new DispatcherTimer { Interval = TimeSpan.FromSeconds(9) };
+        _updateToastTimer.Tick -= OnUpdateToastTick;
+        _updateToastTimer.Tick += OnUpdateToastTick;
+        _updateToastTimer.Stop();
+        _updateToastTimer.Start();
+    }
+
+    private void OnUpdateToastTick(object? sender, EventArgs e) => HideUpdateToast();
+
+    private void HideUpdateToast()
+    {
+        _updateToastTimer?.Stop();
+        if (_updateToast is not null)
+            _updateToast.IsVisible = false;
+    }
+
+    /// <summary>Help ▸ Check for Updates: an explicit user request, so it bypasses the enable switch
+    /// and always answers with a dialog (update, up-to-date, not-installable, or the failure).</summary>
+    private async Task CheckForUpdatesAsync()
+    {
+        if (_updateService is not { } service)
+            return;
+        UpdateService.Outcome outcome = await service.CheckAsync(_userSettings, force: true);
+        RefreshUpdateAffordances();
+        switch (outcome)
+        {
+            case UpdateService.Outcome.UpdateAvailable:
+                await ShowUpdateDialogAsync();
+                break;
+            case UpdateService.Outcome.UpToDate:
+                await MessageDialog.Show(this, "Check for Updates",
+                    $"You are running the latest version ({Program.AppVersion}).");
+                break;
+            case UpdateService.Outcome.NotInstalled:
+                await UpdateNotInstalledDialog.Show(this);
+                break;
+            case UpdateService.Outcome.Failed:
+                await MessageDialog.Show(this, "Check for Updates",
+                    service.LastError ?? "The update check failed.");
+                break;
+        }
+    }
+
+    /// <summary>Shows the update-available dialog (download + apply live inside it); "Skip This Version"
+    /// persists the dismissal so the badge stays hidden for exactly that release (the no-nagging rule).</summary>
+    private async Task ShowUpdateDialogAsync()
+    {
+        if (_updateService is not { AvailableVersion: { } version } service)
+            return;
+        UpdateDialogResult result = await UpdateAvailableDialog.Show(this, service);
+        if (result == UpdateDialogResult.Skip)
+        {
+            _userSettings = _userSettings with { UpdateDismissedTag = version };
+            UserSettingsFile.Save(_userSettings);
+            RefreshUpdateAffordances();
+        }
+    }
+
+    // Guards the first-run integration offer to once per process: MainWindow is rebuilt on File ▸ New / Open
+    // session swaps, and each new window's Opened would otherwise re-ask before the settings flag is written.
+    private static bool _linuxIntegrationOffered;
+
+    /// <summary>
+    /// First-run only (PLAN.md step 36): on a Linux AppImage that hasn't been integrated yet, offers to add
+    /// Sprocket to the applications menu — an AppImage never registers itself, so without this it only ever
+    /// runs by double-clicking the file. A no-op everywhere else (other OSes, portable/dev runs, or once the
+    /// user has already answered). The answer is persisted either way so the prompt never nags again; the
+    /// Help ▸ Add/Remove items remain the way in afterwards.
+    /// </summary>
+    private async Task MaybeOfferLinuxDesktopIntegrationAsync()
+    {
+        if (_linuxIntegrationOffered)
+            return;
+        _linuxIntegrationOffered = true;
+
+        if (!LinuxDesktopIntegration.IsAvailable || _userSettings.LinuxDesktopIntegrationPrompted)
+            return;
+
+        // Already integrated (e.g. the user added it from the Help menu on a prior run): record that there is
+        // nothing to ask and move on, rather than offering to add what is already there.
+        if (LinuxDesktopIntegration.IsInstalled)
+        {
+            _userSettings = _userSettings with { LinuxDesktopIntegrationPrompted = true };
+            UserSettingsFile.Save(_userSettings);
+            return;
+        }
+
+        bool add = await ConfirmDialog.Show(this, "Add to Applications Menu",
+            "Add DaVinci Project to your applications menu so you can launch it like any installed app? "
+            + "This adds a launcher and icon for your user account — you can remove it later from the Help menu.",
+            "Add", "Not Now");
+
+        _userSettings = _userSettings with { LinuxDesktopIntegrationPrompted = true };
+        UserSettingsFile.Save(_userSettings);
+
+        if (add)
+            await AddToApplicationsMenuAsync();
+    }
+
+    /// <summary>Help ▸ Add to Applications Menu (and the accepted first-run offer): writes the launcher + icon
+    /// off the UI thread, then reports the outcome.</summary>
+    private async Task AddToApplicationsMenuAsync()
+    {
+        bool ok;
+        try
+        {
+            // Render the icon sizes on the UI thread (Avalonia bitmap scaling), then do the file/cache IO off it.
+            IReadOnlyDictionary<int, byte[]> icons = LinuxDesktopIntegration.RenderIcons();
+            ok = await Task.Run(() => LinuxDesktopIntegration.Install(icons));
+        }
+        catch (Exception ex)
+        {
+            CrashLog.Write("Linux desktop integration install failed", ex);
+            ok = false;
+        }
+        await MessageDialog.Show(this, "Applications Menu", ok
+            ? "DaVinci Project was added to your applications menu. If it doesn't appear right away, log out and back "
+              + "in (or restart the desktop shell) to refresh the menu."
+            : "DaVinci Project could not be added to the applications menu. See Help ▸ About ▸ Open Logs Folder for details.");
+    }
+
+    /// <summary>Help ▸ Remove from Applications Menu: removes the launcher + icon this user installed.</summary>
+    private async Task RemoveFromApplicationsMenuAsync()
+    {
+        bool ok = await Task.Run(LinuxDesktopIntegration.Uninstall);
+        await MessageDialog.Show(this, "Applications Menu", ok
+            ? "DaVinci Project was removed from your applications menu."
+            : "DaVinci Project could not be removed from the applications menu. See Help ▸ About ▸ Open Logs Folder for details.");
+    }
+
+    /// <summary>
+    /// Starts the 1 Hz live-telemetry poll (created lazily) and seeds the fps baseline. Called on transition to
+    /// Playing. The timer runs only while playing (see <see cref="StopTelemetryTimer"/>), so an idle editor does no
+    /// periodic work — the readout is event-driven at rest (ARCHITECTURE.md §1: no work on the frame hot path).
+    /// </summary>
+    private void StartTelemetryTimer()
+    {
+        PlaybackEngine? engine = _active?.CurrentEngine ?? _engine;
+        _prevStatsTs = Stopwatch.GetTimestamp();
+        _prevDelivered = engine?.GetStatistics().FramesDelivered ?? 0;
+
+        if (_telemetryTimer is null)
+        {
+            // 1 Hz: fps is glanceable, and a 1 s window keeps frame-count quantization to ≈±1 fps while halving the
+            // wake-ups of the diagnostics overlay's 2 Hz poll. It only ever runs during playback.
+            _telemetryTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+            _telemetryTimer.Tick += OnTelemetryTick;
+        }
+        _telemetryTimer.Start();
+    }
+
+    /// <summary>Stops the live poll and settles the status bar back to the nominal-rate readout + idle state dot.</summary>
+    private void StopTelemetryTimer()
+    {
+        _telemetryTimer?.Stop();
+        _proxyAdvisor.Reset(); // a drop streak must not straddle two separate plays
+        UpdateTelemetry();
+        UpdateEngineStatus();
+    }
+
+    /// <summary>The live-telemetry tick: derives the measured preview fps from the delta of the engine's cumulative
+    /// delivered-frame counter (holds included, so slow-motion clips read at the timeline rate) over the real
+    /// elapsed interval, and refreshes the GPU/hw-accel status (it can change as the
+    /// playhead crosses clips). Stops itself if playback has ended so it never spins at idle.</summary>
+    private void OnTelemetryTick(object? sender, EventArgs e)
+    {
+        PlaybackEngine? engine = _active?.CurrentEngine ?? _engine;
+        if (engine is null || (_active?.State ?? PlaybackState.Stopped) != PlaybackState.Playing)
+        {
+            StopTelemetryTimer();
+            return;
+        }
+
+        long now = Stopwatch.GetTimestamp();
+        PlaybackStatistics stats = engine.GetStatistics();
+        double seconds = (now - _prevStatsTs) / (double)Stopwatch.Frequency;
+        if (seconds > 0)
+            RenderTelemetry((stats.FramesDelivered - _prevDelivered) / seconds);
+        _prevDelivered = stats.FramesDelivered;
+        _prevStatsTs = now;
+
+        UpdateEngineStatus();
+        SampleProxyAdvisor(engine, stats);
+    }
+
+    /// <summary>
+    /// Feeds this telemetry tick to the proxy drop monitor (PLAN.md step 18): when the Program preview is
+    /// software-decoding an original and sustains dropped frames, the advisor recommends a proxy — marked in the
+    /// Proxy window (never auto-built; the user clicks Generate) and hinted in the status bar. Program monitor
+    /// only: the Source monitor deliberately previews originals, so a proxy would not change what it plays.
+    /// </summary>
+    /// <remarks>
+    /// Sampling is skipped unless <b>exactly one</b> media source is being decoded. The engine's drop counter is
+    /// a single sequence-wide tally (it counts skipped timeline frames per pump tick, not per decoder), so with
+    /// several layers active there is nothing that says <em>which</em> one starved the pump — and blaming the
+    /// wrong clip would build a proxy that fixes nothing. Multi-layer stretches therefore produce no
+    /// recommendation rather than a guess; the static policy still covers those sources at import.
+    /// </remarks>
+    private void SampleProxyAdvisor(PlaybackEngine engine, PlaybackStatistics stats)
+    {
+        if (_proxy is not { } proxy || _project is null || !ReferenceEquals(_active, _program))
+        {
+            _proxyAdvisor.Reset();
+            return;
+        }
+
+        IReadOnlyList<ActiveVideoSource> sources = engine.GetActiveVideoSources();
+        if (sources.Count != 1 || _project.MediaPool.Get(sources[0].MediaId) is not { } media)
+        {
+            _proxyAdvisor.Reset();
+            return;
+        }
+        ActiveVideoSource active = sources[0];
+
+        var sample = new Proxy.ProxyAdvisorSample(
+            active.MediaId,
+            Environment.TickCount64,
+            stats.FramesDropped,
+            IsPlaying: true, // the tick stops itself when playback ends, so a tick that got here is a playing one
+            IsSoftwareDecoded: !active.Decode.IsHardwareAccelerated,
+            IsDifficultFormat: ProxyPolicy.IsDemandingFormat(media.Info),
+            IsEligible: proxy.StateOf(active.MediaId) == ProxyState.NotNeeded);
+
+        if (_proxyAdvisor.Observe(sample) is { } id && proxy.RecommendProxy(id))
+        {
+            string name = Path.GetFileName(media.AbsolutePath);
+            SetStatus(proxy.Enabled
+                ? $"Playback is dropping frames on {name} — a proxy is recommended (View ▸ Proxy ▸ Generate)"
+                : $"Playback is dropping frames on {name} — turn proxies on, then Generate (View ▸ Proxy)");
+        }
+    }
+
+    private void UpdateTimelineHeader()
+    {
+        if (_project is null)
+            return;
+        int tracks = _project.Timeline.Tracks.Count;
+        _timelineHeader!.Text = $"Timeline · {_projectName} · {tracks} track{(tracks == 1 ? "" : "s")}";
+    }
+
+    /// <summary>
+    /// Binds the Project panel's tabbed media browser (PLAN.md step 15): the media bin (poster/waveform
+    /// thumbnails + badges + search), the Effects browser (double-click adds to the selected clip via the
+    /// command stack), and the Audio tab. The browser reports its item count to the pane header and routes
+    /// hints to the status strip. Independent of playback, so the bin works even when no engine is available.
+    /// </summary>
+    private void WireMediaBrowser()
+    {
+        if (_project is null || this.FindControl<MediaBrowserPanel>("MediaBrowser") is not { } browser)
+            return;
+
+        _mediaBrowser = browser;
+        _thumbnails = new ThumbnailService();
+
+        var itemsText = this.FindControl<TextBlock>("ProjectItemsText")!;
+        browser.ItemCountChanged += n => itemsText.Text = n == 1 ? "1 item" : $"{n} items";
+        browser.Status += SetStatus;
+        browser.FilesDropped += paths => _ = ImportAsync(paths); // OS file-drop onto the bin (PLAN.md step 16b)
+        // Double-clicking a transition in the browser applies it to the selected clip's cut (PLAN.md step 25).
+        browser.TransitionActivated += id => _timeline?.ApplyTransitionToSelectedCut(id);
+        browser.InterpretFootageRequested += media => _ = InterpretFootageAsync(media); // PLAN.md step 42
+        browser.Attach(_project, _history, _thumbnails);
+
+        WireMixer(browser);
+    }
+
+    /// <summary>
+    /// Installs the audio mixer into the Project panel's Audio tab (PLAN.md step 30, UI.md §3.3): per-track gain /
+    /// pan / mute / solo + a master strip with the live loudness meters, and loudness-normalization to a target at
+    /// track / master scope. The meters read the audio engine's live loudness (null on the software clock);
+    /// normalization measures a scope's raw loudness offline through the same decode plumbing.
+    /// </summary>
+    private void WireMixer(MediaBrowserPanel browser)
+    {
+        if (_project is null)
+            return;
+
+        _mixer = new Mixer.MixerView();
+        Func<Sprocket.Audio.Loudness.LoudnessSnapshot>? readLoudness =
+            _audioClock is { } clock ? () => clock.CurrentLoudness : null;
+
+        _mixer.Attach(
+            _project, _history,
+            readLoudness,
+            measureTrack: track => MeasureTrackLoudness(track),
+            measureMaster: () => MeasureMasterLoudness());
+        // Clicking an insert row opens the chain in the Inspector (PLAN.md step 31) — the mixer's rows are
+        // the add/enable/reorder surface; parameters/keyframes edit in the Inspector like clip effects.
+        _mixer.InspectChainRequested += target =>
+        {
+            _inspector?.SetSelectedChain(target);
+            if (_showInspectorMenuItem is { } item && item.IsChecked != true)
+            {
+                item.IsChecked = true;
+                SetPanelVisible(project: false, true);
+            }
+        };
+        browser.SetMixer(_mixer);
+    }
+
+    /// <summary>Measures one audio track's raw integrated loudness (unity track/master gain) for normalization
+    /// (PLAN.md step 30). Runs on the caller (UI) thread over the project's audio span; sources decode through the
+    /// same PCM readers playback uses. Offline sources measure as silence.</summary>
+    private Sprocket.Audio.Loudness.LoudnessMeasurement MeasureTrackLoudness(AudioTrack track)
+    {
+        if (_project is null)
+            return Sprocket.Audio.Loudness.LoudnessMeasurement.Silent;
+        using AudioMixer mixer = MediaBootstrap.CreateAnalysisMixer(_project);
+        var scope = new AudioPlanScope(OnlyTrack: track, UnityTrackGain: true, UnityMasterGain: true);
+        return Sprocket.Audio.Loudness.LoudnessAnalyzer.MeasureMix(
+            mixer, _project, _project.ActiveSequence, Timecode.Zero, _project.ActiveSequence.Timeline.Duration, scope);
+    }
+
+    /// <summary>Measures the full mix's integrated loudness at unity master gain for master normalization
+    /// (PLAN.md step 30). Offline sources measure as silence.</summary>
+    private Sprocket.Audio.Loudness.LoudnessMeasurement MeasureMasterLoudness()
+    {
+        if (_project is null)
+            return Sprocket.Audio.Loudness.LoudnessMeasurement.Silent;
+        using AudioMixer mixer = MediaBootstrap.CreateAnalysisMixer(_project);
+        return Sprocket.Audio.Loudness.LoudnessAnalyzer.MeasureMix(
+            mixer, _project, _project.ActiveSequence, Timecode.Zero, _project.ActiveSequence.Timeline.Duration,
+            new AudioPlanScope(UnityMasterGain: true));
+    }
+
+    /// <summary>
+    /// Binds the type-driven Inspector (PLAN.md step 16): the selected clip's Clip section + one section per
+    /// effect, each built from the effect's parameter descriptors with slider/numeric editing and keyframe
+    /// affordances, all through the command stack. The playhead accessor lets animated values display (and
+    /// keyframe in) at the current time. Independent of playback, so it works even with no engine.
+    /// </summary>
+    private void WireInspector()
+    {
+        if (_project is null || this.FindControl<InspectorPanel>("Inspector") is not { } inspector)
+            return;
+
+        _inspector = inspector;
+        inspector.Attach(_project, _history, () => _engine?.Position ?? Timecode.Zero);
+        inspector.SetLiveAudioMixer(() => _audioClock?.Mixer);
+    }
+
+    // ── Transport ───────────────────────────────────────────────────────────────────────────────────
+
+    private void WireTransport()
+    {
+        _playPause = this.FindControl<Button>("PlayPauseButton")!;
+        _playPauseIcon = this.FindControl<ShapesPath>("PlayPauseIcon")!;
+        _scrubber = this.FindControl<Slider>("Scrubber")!;
+        _positionText = this.FindControl<TextBlock>("PositionText")!;
+        _durationText = this.FindControl<TextBlock>("DurationText")!;
+
+        // The Program monitor composites the timeline at the sequence resolution; the Source monitor previews a
+        // single selected clip's source (built lazily when its tab is opened). Both present through the one shared
+        // surface; the active tab decides which engine is attached to it.
+        _preview = this.FindControl<PreviewSurface>("Preview")!;
+        (int seqW, int seqH) = (_project!.Timeline.Resolution.Width, _project.Timeline.Resolution.Height);
+        _program = new ProgramMonitor(_engine!, seqW, seqH);
+        _source = new SourceMonitor();
+        _active = _program;
+
+        // Re-bind the surface whenever the active monitor's engine is replaced (the Source monitor rebuilds).
+        _source.EngineChanged += () => Dispatcher.UIThread.Post(() => { if (ReferenceEquals(_active, _source)) BindActiveToSurface(); });
+        BindActiveToSurface(); // attach the program engine to the surface
+
+        WireTimeline();
+        WireMonitorTabs();
+        WireZoomAndGuides();
+        WireScopes();
+
+        _exportButton!.Click += (_, _) => _ = ExportAsync();
+        WireAddTrackButton();
+        WireMarkersButton();
+
+        // Transport buttons drive the active monitor.
+        _playPause.Click += (_, _) => _active!.TogglePlayPause();
+        this.FindControl<Button>("JumpStartButton")!.Click += (_, _) => _active!.JumpToStart();
+        this.FindControl<Button>("JumpEndButton")!.Click += (_, _) => _active!.JumpToEnd();
+        this.FindControl<Button>("StepBackButton")!.Click += (_, _) => _active!.StepFrame(-1);
+        this.FindControl<Button>("StepForwardButton")!.Click += (_, _) => _active!.StepFrame(+1);
+        _prevKeyframeButton = this.FindControl<Button>("PrevKeyframeButton")!;
+        _nextKeyframeButton = this.FindControl<Button>("NextKeyframeButton")!;
+        _prevKeyframeButton.Click += (_, _) => JumpToKeyframe(-1);
+        _nextKeyframeButton.Click += (_, _) => JumpToKeyframe(+1);
+        RefreshKeyframeNav();
+
+        _scrubber.ValueChanged += (_, e) =>
+        {
+            if (_suppressSeek)
+                return;
+            // Snap to a frame boundary and skip same-frame repeats, so a drag issues one seek per frame
+            // crossed instead of a sub-frame-unique seek per pixel (which would defeat the engine's
+            // repeat-frame fast path and force a full decode per pointer move).
+            Rational fps = _active!.FrameRate;
+            Timecode t = new Timecode((long)e.NewValue).SnapToFrame(fps);
+            long frame = fps.Num > 0 ? t.ToFrameIndex(fps) : t.Ticks;
+            if (frame == _lastScrubberSeekFrame)
+                return;
+            _lastScrubberSeekFrame = frame;
+            _active.SeekTo(t);
+        };
+
+        // Both monitors report position/state; the readouts update only for the active one. The Inspector tracks
+        // the Program playhead specifically (its keyframes edit the timeline at that time).
+        WireMonitorReadouts(_program, isProgram: true);
+        WireMonitorReadouts(_source, isProgram: false);
+        RefreshTransportForActive();
+
+        // Show the decode path (GPU/CPU) in the status bar as soon as frame 0 has decoded — without any idle
+        // polling. A one-shot present handler refreshes the status once, then unsubscribes; at startup the decode
+        // info isn't populated yet (the first pump is still in flight), so the initial RefreshTransportForActive
+        // above only had the state word. FramePresented fires on the pump thread, so marshal to the UI thread.
+        void OnFirstPresent()
+        {
+            _engine!.FramePresented -= OnFirstPresent;
+            Dispatcher.UIThread.Post(UpdateEngineStatus);
+        }
+        _engine!.FramePresented += OnFirstPresent;
+
+        // A pump iteration can fault (e.g. the audio device hiccupping during the end-of-timeline stop); the
+        // engine keeps the transport alive rather than dying, so surface the reason instead of swallowing it.
+        _engine!.PumpError += ex => Dispatcher.UIThread.Post(() => SetStatus($"Playback recovered from an error: {ex.Message}"));
+
+        // Audio device loss/recovery (ARCHITECTURE.md §8): the master clock recovers in place — reopening the
+        // default device, or falling back to software timing so the timeline keeps advancing without audio — but
+        // that must not be silent. Fires on the feeder thread, so marshal to the UI thread for the status bar.
+        if (_audioClock is not null)
+        {
+            _audioClock.OutputStatusChanged += status => Dispatcher.UIThread.Post(() => SetStatus(status switch
+            {
+                Sprocket.Audio.AudioEngine.OutputStatus.Recovering => "Audio device lost — reconnecting…",
+                Sprocket.Audio.AudioEngine.OutputStatus.Recovered => "Audio device reconnected.",
+                Sprocket.Audio.AudioEngine.OutputStatus.SoftwareFallback => "Audio device unavailable — playing without audio.",
+                _ => "",
+            }));
+        }
+
+        // Preview proxies (PLAN.md step 18): the engine already switches onto a proxy transparently when one is
+        // ready (wired in the bootstrap); here we just reflect progress in the status bar without interrupting flow.
+        // Subscribed whenever there is a service at all, not only when it starts out enabled: proxies can now be
+        // switched on mid-session from View ▸ Proxy, and a gate here would leave the status bar silent for the rest
+        // of the session in exactly that case.
+        if (_proxy is not null)
+        {
+            _proxy.ProgressChanged += () => Dispatcher.UIThread.Post(() =>
+            {
+                if (_proxy.StatusSummary() is { } summary)
+                    SetStatus(summary);
+            });
+            // The bootstrap enqueues the loaded project's sources before this window exists, so that first
+            // ProgressChanged is raised with nobody listening — read the tally once to catch up.
+            if (_proxy.StatusSummary() is { } initial)
+                SetStatus(initial);
+        }
+
+        // Optional timed auto-exit for unattended profiling runs: SPROCKET_APP_SECONDS=12
+        if (int.TryParse(Environment.GetEnvironmentVariable("SPROCKET_APP_SECONDS"), out int seconds) && seconds > 0)
+            DispatcherTimer.RunOnce(Close, TimeSpan.FromSeconds(seconds));
+    }
+
+    /// <summary>Routes a monitor's position/state events to the transport readouts, but only while it is the
+    /// active monitor. The Program monitor additionally drives the Inspector's playhead.</summary>
+    private void WireMonitorReadouts(IMonitor monitor, bool isProgram)
+    {
+        monitor.PositionChanged += pos => Dispatcher.UIThread.Post(() =>
+        {
+            if (isProgram)
+                _inspector?.OnPlayheadMoved(); // animated parameter values track the Program playhead
+            if (!ReferenceEquals(_active, monitor))
+                return;
+            _lastScrubberSeekFrame = -1; // position moved (playback/echo) — don't skip a drag back to the old frame
+            _suppressSeek = true;
+            _scrubber!.Value = Math.Clamp(pos.Ticks, 0, _scrubber.Maximum);
+            _suppressSeek = false;
+            _positionText!.Text = FormatTime(pos);
+        });
+
+        monitor.StateChanged += state => Dispatcher.UIThread.Post(() =>
+        {
+            if (!ReferenceEquals(_active, monitor))
+                return;
+            SetPlayPauseGlyph(state == PlaybackState.Playing);
+            UpdateEngineStatus();
+            if (state == PlaybackState.Playing)
+                StartTelemetryTimer();
+            else
+                StopTelemetryTimer(); // Paused / Stopped → settle to the nominal readout, stop polling
+        });
+    }
+
+    /// <summary>
+    /// Keeps the Play/Pause button's icon and its screen-reader name in sync: while playing it shows the
+    /// pause icon and announces "Pause"; while paused it shows the play icon and announces "Play".
+    /// </summary>
+    private void SetPlayPauseGlyph(bool playing)
+    {
+        if (_playPause is null)
+            return;
+        if (_playPauseIcon is not null)
+            _playPauseIcon.Data = playing ? Icons.Pause : Icons.Play;
+        AutomationProperties.SetName(_playPause, playing ? "Pause" : "Play");
+    }
+
+    /// <summary>Attaches the active monitor's current engine to the shared surface at its logical frame size, or
+    /// clears the surface if the monitor has nothing loaded.</summary>
+    private void BindActiveToSurface()
+    {
+        if (_active!.CurrentEngine is { } engine)
+        {
+            _preview!.SetFrameSize(_active.FrameWidth, _active.FrameHeight);
+            _preview.Attach(engine);
+        }
+        else
+        {
+            _preview!.Detach();
+        }
+    }
+
+    /// <summary>View ▸ Full Screen Preview (Ctrl+F; ⌘F on macOS — the full-screen viewer convention in leading editors): the picture
+    /// takes over the whole screen while the transport keys (Space, I/O, arrows…) stay live. Esc or Ctrl+F exits.</summary>
+    private void ToggleFullscreenPreview()
+    {
+        if (_previewFullscreen)
+            ExitFullscreenPreview();
+        else
+            EnterFullscreenPreview();
+    }
+
+    /// <summary>
+    /// Reparents the shared <see cref="PreviewSurface"/> into the window-covering overlay and takes the window
+    /// fullscreen. Single-window by design: one compositor → one GRContext lease path (ARCHITECTURE.md §10), and
+    /// the window-level OnKeyDown keeps every transport shortcut working with no rewiring. Deliberate departure
+    /// from leading editors: no second-monitor clean-feed output (that needs a second window — future work).
+    /// </summary>
+    private void EnterFullscreenPreview()
+    {
+        if (_previewFullscreen || _exporting || _preview is null || _fullscreenPreviewHost is null || _root is null)
+            return;
+        if (_active?.CurrentEngine is null || _preview.Parent is not Panel home)
+            return; // nothing loaded to show
+
+        // Reparenting detaches the surface from the visual tree, which disposes its effect pipeline; it must be
+        // Detach()ed first and re-Attach()ed after (a bare Attach with the same engine early-returns — dead surface).
+        _previewHome = home;
+        _preview.Detach();
+        home.Children.Remove(_preview);
+        _fullscreenPreviewHost.Children.Add(_preview);
+
+        _zoomBeforeFullscreenPreview = _preview.Zoom;
+        _preview.Zoom = MonitorZoom.Fit; // the overlay always fits the screen (the convention in leading editors)
+        _preview.Scopes = null;          // don't pay per-frame scope sampling for the hidden panel
+
+        _fullscreenPreviewHost.IsVisible = true;
+        _root.IsVisible = false; // the covered UI shouldn't layout/render per frame or catch Tab focus
+        _previewFullscreen = true;
+        BindActiveToSurface();
+
+        if (WindowState != WindowState.FullScreen)
+        {
+            _enteredWindowFullScreenForPreview = true;
+            ToggleWindowFullScreen();
+        }
+    }
+
+    /// <summary>Re-docks the surface into its monitor pane and restores zoom/scopes; leaves window fullscreen
+    /// only if the preview itself entered it.</summary>
+    private void ExitFullscreenPreview()
+    {
+        if (!_previewFullscreen || _preview is null || _fullscreenPreviewHost is null || _root is null)
+            return;
+
+        _preview.Detach();
+        _fullscreenPreviewHost.Children.Remove(_preview);
+        _previewHome?.Children.Add(_preview); // added last → the monitor DockPanel's fill slot
+        _previewHome = null;
+
+        _preview.Zoom = _zoomBeforeFullscreenPreview;
+        _preview.Scopes = _scopeState;
+
+        _fullscreenPreviewHost.IsVisible = false;
+        _root.IsVisible = true;
+        _previewFullscreen = false;
+        BindActiveToSurface();
+
+        if (_enteredWindowFullScreenForPreview)
+        {
+            _enteredWindowFullScreenForPreview = false;
+            if (WindowState == WindowState.FullScreen)
+                ToggleWindowFullScreen();
+        }
+    }
+
+    /// <summary>Switches between the Program and Source monitors (UI.md §3.4): pauses the outgoing monitor,
+    /// builds/frees the Source engine, re-binds the shared surface, and re-points the transport readouts.</summary>
+    private void WireMonitorTabs()
+    {
+        var programTab = this.FindControl<RadioButton>("ProgramTab")!;
+        var sourceTab = this.FindControl<RadioButton>("SourceTab")!;
+
+        programTab.IsCheckedChanged += (_, _) =>
+        {
+            if (programTab.IsChecked != true)
+                return;
+            _source!.Deactivate();
+            _active = _program!;
+            BindActiveToSurface();
+            RefreshTransportForActive();
+        };
+
+        sourceTab.IsCheckedChanged += (_, _) =>
+        {
+            if (sourceTab.IsChecked != true)
+                return;
+            _program!.Pause();
+            _active = _source!;
+            _source!.Activate(); // raises EngineChanged → binds the surface
+            BindActiveToSurface();
+            RefreshTransportForActive();
+        };
+    }
+
+    /// <summary>Binds the <c>Fit ▾</c> zoom level and the safe-area/framing-grid toggle to the shared surface.</summary>
+    private void WireZoomAndGuides()
+    {
+        var zoomBox = this.FindControl<ComboBox>("ZoomBox")!;
+        zoomBox.SelectionChanged += (_, _) =>
+        {
+            _preview!.Zoom = zoomBox.SelectedIndex switch
+            {
+                1 => MonitorZoom.Percent50,
+                2 => MonitorZoom.Percent100,
+                3 => MonitorZoom.Percent200,
+                _ => MonitorZoom.Fit,
+            };
+        };
+
+        if (_guidesToggle is not null)
+            _guidesToggle.IsCheckedChanged += (_, _) => _preview!.ShowGuides = _guidesToggle.IsChecked == true;
+    }
+
+    /// <summary>
+    /// Binds the grading scopes (PLAN.md step 34): the header's scope selector shows/hides the scope panel
+    /// under the picture and tells the shared surface which analysis to produce per presented frame; the
+    /// panel redraws whenever a capture refreshes the bins.
+    /// </summary>
+    private void WireScopes()
+    {
+        var scopeBox = this.FindControl<ComboBox>("ScopeBox")!;
+        var scopeHost = this.FindControl<Border>("ScopeHost")!;
+        var scopePanel = this.FindControl<ScopeView>("ScopePanel")!;
+
+        _scopeState = new ScopeState();
+        _preview!.Scopes = _scopeState;
+        scopePanel.Attach(_scopeState);
+
+        scopeBox.SelectionChanged += (_, _) =>
+        {
+            _scopeState.ActiveKind = scopeBox.SelectedIndex switch
+            {
+                1 => ScopeKind.Waveform,
+                2 => ScopeKind.RgbParade,
+                3 => ScopeKind.Vectorscope,
+                4 => ScopeKind.Histogram,
+                _ => ScopeKind.None,
+            };
+            scopeHost.IsVisible = _scopeState.ActiveKind != ScopeKind.None;
+            // Re-present so a paused monitor samples the current frame for the new scope immediately.
+            _preview!.InvalidateVisual();
+        };
+    }
+
+    /// <summary>Re-points the transport readouts (scrubber range, position/duration text, play glyph, state) at
+    /// the currently active monitor — after a tab switch or a Source-clip change.</summary>
+    private void RefreshTransportForActive()
+    {
+        IMonitor m = _active!;
+        _lastScrubberSeekFrame = -1; // a newly-active monitor's first scrubber seek must always go through
+        _suppressSeek = true;
+        _scrubber!.Maximum = Math.Max(1, m.Duration.Ticks);
+        _scrubber.Value = Math.Clamp(m.Position.Ticks, 0, _scrubber.Maximum);
+        _suppressSeek = false;
+        _positionText!.Text = FormatTime(m.Position);
+        _durationText!.Text = FormatTime(m.Duration);
+        SetPlayPauseGlyph(m.State == PlaybackState.Playing);
+        UpdateEngineStatus();
+        // Follow the newly-active monitor's transport: poll while it's playing, otherwise stay event-driven.
+        if (m.State == PlaybackState.Playing)
+            StartTelemetryTimer();
+        else
+            StopTelemetryTimer();
+    }
+
+    /// <summary>
+    /// Binds the custom timeline control to the project / edit history / engine and connects the timeline's
+    /// chrome (zoom buttons, the Snapping toggle) and its selection back to the shell.
+    /// </summary>
+    private void WireTimeline()
+    {
+        var timeline = this.FindControl<TimelineControl>("Timeline")!;
+        _timeline = timeline;
+        timeline.Attach(_project!, _history, _engine);
+        timeline.ClipPlaced += UpdateTimelineHeader; // a media-bin drop / paste may extend the timeline
+        timeline.Status += SetStatus;                 // transition hints, etc. (PLAN.md step 25)
+        timeline.ClipContextMenuRequested += ShowClipContextMenu; // clip right-click menu (PLAN.md step 53)
+        WireTrackRename(timeline);
+        WireTitleEdit(timeline);
+        UpdateRenderBar(); // initial render-bar state (a reopened project may already have valid renders, step 32)
+
+        this.FindControl<Button>("ZoomInButton")!.Click += (_, _) => timeline.ZoomIn();
+        this.FindControl<Button>("ZoomOutButton")!.Click += (_, _) => timeline.ZoomOut();
+
+        if (_snappingToggle is not null)
+        {
+            timeline.Snapping = _snappingToggle.IsChecked == true;
+            _snappingToggle.IsCheckedChanged += (_, _) => timeline.Snapping = _snappingToggle.IsChecked == true;
+        }
+
+        var linked = this.FindControl<ToggleButton>("LinkedToggle")!;
+        timeline.Linked = linked.IsChecked == true;
+        linked.IsCheckedChanged += (_, _) => timeline.Linked = linked.IsChecked == true;
+
+        // Playback auto-scroll is a persisted preference (View ▸ Playback Auto-Scroll), not a session toggle.
+        timeline.AutoScroll = UserSettingsStore.ParseAutoScroll(_userSettings.TimelineAutoScroll);
+
+        // Tool palette (radio group): each button selects the matching timeline tool.
+        WireTool("SelectTool", EditTool.Select, timeline);
+        WireTool("BladeTool", EditTool.Blade, timeline);
+        WireTool("RippleTool", EditTool.Ripple, timeline);
+        WireTool("RollTool", EditTool.Roll, timeline);
+        WireTool("SlipTool", EditTool.Slip, timeline);
+        WireTool("SlideTool", EditTool.Slide, timeline);
+        WireTool("HandTool", EditTool.Hand, timeline);
+        WireTool("ZoomTool", EditTool.Zoom, timeline);
+
+        timeline.SelectedClipChanged += clip =>
+        {
+            _selectedClip = clip;
+            _mediaBrowser?.SetSelectedClip(clip); // the Effects browser applies to this clip
+            _inspector?.SetSelectedClip(clip);    // the Inspector edits this clip's properties
+            RefreshKeyframeNav();
+
+            // The Source monitor previews the selected clip's source (rebuilds lazily only while its tab is open).
+            MediaRef? media = clip is null ? null : _project!.MediaPool.Get(clip.MediaRefId);
+            _source?.SetSource(media);
+            if (ReferenceEquals(_active, _source))
+                RefreshTransportForActive();
+
+            string? name = media is null ? null : Path.GetFileName(media.AbsolutePath ?? "clip");
+            SetStatus(name is null ? "" : $"Selected: {name}");
+        };
+    }
+
+    /// <summary>
+    /// Wires the inline track-rename editor: the timeline raises <see cref="TimelineControl.TrackRenameRequested"/>
+    /// on a name double-click; we position the overlaid <c>TrackRenameEditor</c> over the name and focus it.
+    /// Enter / lost-focus commit through the edit history (undoable); Escape cancels.
+    /// </summary>
+    private void WireTrackRename(TimelineControl timeline)
+    {
+        _trackRenameEditor = this.FindControl<TextBox>("TrackRenameEditor")!;
+
+        timeline.TrackRenameRequested += (track, rect) =>
+        {
+            _renameTarget = track;
+            _trackRenameEditor.Margin = new Thickness(rect.X, rect.Y, 0, 0);
+            _trackRenameEditor.Width = rect.Width;
+            _trackRenameEditor.Height = rect.Height;
+            _trackRenameEditor.Text = track.Name;
+            _trackRenameEditor.IsVisible = true;
+            // Focus after layout so the freshly-shown box takes focus and selects its text.
+            Dispatcher.UIThread.Post(() =>
+            {
+                _trackRenameEditor.Focus();
+                _trackRenameEditor.SelectAll();
+            });
+        };
+
+        _trackRenameEditor.KeyDown += (_, e) =>
+        {
+            if (e.Key == Key.Enter || e.Key == Key.Return)
+            {
+                CommitTrackRename();
+                e.Handled = true;
+            }
+            else if (e.Key == Key.Escape)
+            {
+                CancelTrackRename();
+                e.Handled = true;
+            }
+        };
+        _trackRenameEditor.LostFocus += (_, _) => CommitTrackRename();
+    }
+
+    // Commits the inline rename (no-op if the editor is hidden / nothing targeted). Clearing the target and
+    // hiding before delegating means the LostFocus that hiding triggers re-enters as a no-op.
+    private void CommitTrackRename()
+    {
+        if (_renameTarget is null || _trackRenameEditor is null || !_trackRenameEditor.IsVisible)
+            return;
+        Sprocket.Core.Model.Track target = _renameTarget;
+        string text = _trackRenameEditor.Text ?? string.Empty;
+        _renameTarget = null;
+        _trackRenameEditor.IsVisible = false;
+        _timeline?.CommitTrackRename(target, text);
+    }
+
+    private void CancelTrackRename()
+    {
+        _renameTarget = null;
+        if (_trackRenameEditor is not null)
+            _trackRenameEditor.IsVisible = false;
+    }
+
+    /// <summary>
+    /// Wires the inline title text editor (PLAN.md step 40), mirroring the track-rename overlay: the timeline
+    /// raises <see cref="TimelineControl.TitleEditRequested"/> on a title-clip double-click; we position the
+    /// overlaid <c>TitleTextEditor</c> over the clip and focus it. Enter / lost-focus commit through the edit
+    /// history (one undoable command); Escape cancels.
+    /// </summary>
+    private void WireTitleEdit(TimelineControl timeline)
+    {
+        _titleTextEditor = this.FindControl<TextBox>("TitleTextEditor")!;
+
+        timeline.TitleEditRequested += (clip, rect) =>
+        {
+            _titleEditTarget = clip;
+            _titleTextEditor.Margin = new Thickness(rect.X, rect.Y, 0, 0);
+            _titleTextEditor.Width = rect.Width;
+            _titleTextEditor.Height = rect.Height;
+            _titleTextEditor.Text = clip.Generator?.GetString(Sprocket.Core.Model.GeneratorParamNames.Text) ?? "";
+            _titleTextEditor.IsVisible = true;
+            Dispatcher.UIThread.Post(() =>
+            {
+                _titleTextEditor.Focus();
+                _titleTextEditor.SelectAll();
+            });
+        };
+
+        _titleTextEditor.KeyDown += (_, e) =>
+        {
+            if (e.Key == Key.Enter || e.Key == Key.Return)
+            {
+                CommitTitleEdit();
+                e.Handled = true;
+            }
+            else if (e.Key == Key.Escape)
+            {
+                CancelTitleEdit();
+                e.Handled = true;
+            }
+        };
+        _titleTextEditor.LostFocus += (_, _) => CommitTitleEdit();
+    }
+
+    // Commits the inline title edit (no-op if the editor is hidden / nothing targeted). Clearing the target
+    // and hiding before delegating means the LostFocus that hiding triggers re-enters as a no-op.
+    private void CommitTitleEdit()
+    {
+        if (_titleEditTarget is null || _titleTextEditor is null || !_titleTextEditor.IsVisible)
+            return;
+        Sprocket.Core.Model.Clip target = _titleEditTarget;
+        string text = _titleTextEditor.Text ?? string.Empty;
+        _titleEditTarget = null;
+        _titleTextEditor.IsVisible = false;
+        _timeline?.CommitTitleText(target, text);
+    }
+
+    private void CancelTitleEdit()
+    {
+        _titleEditTarget = null;
+        if (_titleTextEditor is not null)
+            _titleTextEditor.IsVisible = false;
+    }
+
+    /// <summary>Binds a tool-palette radio button to its <see cref="EditTool"/> on the timeline.</summary>
+    private void WireTool(string name, EditTool tool, TimelineControl timeline)
+    {
+        var button = this.FindControl<RadioButton>(name)!;
+        if (button.IsChecked == true)
+            timeline.ActiveTool = tool;
+        button.IsCheckedChanged += (_, _) =>
+        {
+            if (button.IsChecked == true)
+            {
+                timeline.ActiveTool = tool;
+                SetStatus($"{tool} tool");
+            }
+        };
+    }
+
+    /// <summary>Attaches a flyout to <c>+ Track</c> offering a new Video or Audio track (PLAN.md step 14).</summary>
+    private void WireAddTrackButton()
+    {
+        var button = this.FindControl<Button>("AddTrackButton")!;
+        var videoItem = new MenuItem { Header = "Add _Video Track" };
+        videoItem.Click += (_, _) => AddTrack(video: true);
+        var audioItem = new MenuItem { Header = "Add _Audio Track" };
+        audioItem.Click += (_, _) => AddTrack(video: false);
+        button.Flyout = new MenuFlyout { ItemsSource = new[] { videoItem, audioItem } };
+    }
+
+    /// <summary>
+    /// Adds a video or audio track through an <see cref="AddTrackCommand"/> (PLAN.md step 14), so it is undoable
+    /// and the dirty indicator flips. The new track is appended on top in z-order; the playback engine and mixer
+    /// pick it up live. Tracks are auto-numbered per kind (V1/V2…, A1/A2…).
+    /// </summary>
+    private void AddTrack(bool video)
+    {
+        if (_project is null)
+            return;
+        Sprocket.Core.Model.Track track = video
+            ? new VideoTrack { Name = $"V{_project.Timeline.VideoTracks.Count() + 1}" }
+            : new AudioTrack { Name = $"A{_project.Timeline.AudioTracks.Count() + 1}" };
+        _history.Execute(new AddTrackCommand(_project.Timeline, track));
+    }
+
+    // ── Markers panel (PLAN.md step 20) ─────────────────────────────────────────────────────────────
+
+    /// <summary>Attaches a flyout to the <c>Markers</c> header button: the markers panel — an "add at playhead"
+    /// action plus one row per sequence marker (click to seek, ✕ to remove). Rebuilt each time it opens so it
+    /// reflects the current marker list.</summary>
+    private void WireMarkersButton()
+    {
+        var button = this.FindControl<Button>("MarkersButton");
+        if (button is null)
+            return;
+        var flyout = new Flyout { Placement = PlacementMode.BottomEdgeAlignedRight };
+        flyout.Opened += (_, _) => flyout.Content = BuildMarkersPanel();
+        button.Flyout = flyout;
+    }
+
+    /// <summary>Builds the markers-panel content (PLAN.md step 20, UI.md §3.6): an add-at-playhead button and a
+    /// scrollable list of the sequence markers, each seeking on click with a remove (✕) button.</summary>
+    private Control BuildMarkersPanel()
+    {
+        var root = new StackPanel { Spacing = 6, MinWidth = 260, MaxWidth = 320, Margin = new Thickness(4) };
+        root.Children.Add(new TextBlock
+        {
+            Text = "Markers", FontWeight = Avalonia.Media.FontWeight.SemiBold, FontSize = Typography.Body,
+        });
+
+        var addButton = new Button { Content = "+ Add at playhead", FontSize = Typography.Body, HorizontalAlignment = HorizontalAlignment.Stretch };
+        addButton.Click += (_, _) => { AddMarker(); if (this.FindControl<Button>("MarkersButton")?.Flyout is Flyout f) f.Content = BuildMarkersPanel(); };
+        root.Children.Add(addButton);
+
+        var markers = _project?.Timeline.Markers ?? [];
+        if (markers.Count == 0)
+        {
+            root.Children.Add(new TextBlock
+            {
+                Text = "No markers yet. Press M to add one at the playhead.",
+                FontSize = Typography.Caption, Foreground = Avalonia.Media.Brushes.Gray, TextWrapping = Avalonia.Media.TextWrapping.Wrap,
+            });
+            return root;
+        }
+
+        var list = new StackPanel { Spacing = 2 };
+        // Show markers in time order without mutating the model list.
+        var ordered = markers.Select((m, i) => (Marker: m, Index: i)).OrderBy(x => x.Marker.Time.Ticks).ToList();
+        foreach ((Marker marker, int index) in ordered)
+        {
+            var row = new Grid { ColumnDefinitions = new ColumnDefinitions("8,*,Auto") };
+
+            row.Children.Add(new Border
+            {
+                Width = 8, Height = 8, CornerRadius = new CornerRadius(2), VerticalAlignment = VerticalAlignment.Center,
+                Background = TimelineControl.MarkerBrush(marker.Color),
+            });
+
+            var seek = new Button
+            {
+                Content = MarkerListFormat.Describe(marker, index),
+                FontSize = Typography.Body, HorizontalAlignment = HorizontalAlignment.Stretch,
+                HorizontalContentAlignment = HorizontalAlignment.Left, Background = Avalonia.Media.Brushes.Transparent,
+                Margin = new Thickness(4, 0, 0, 0),
+            };
+            Marker captured = marker;
+            seek.Click += (_, _) => { _program?.SeekTo(captured.Time); };
+            Grid.SetColumn(seek, 1);
+            row.Children.Add(seek);
+
+            var remove = new Button
+            {
+                Content = new ShapesPath
+                {
+                    Data = Icons.Close, Stroke = Avalonia.Media.Brushes.Gray, StrokeThickness = 1.6,
+                    StrokeLineCap = PenLineCap.Round, Width = IconSizes.Compact, Height = IconSizes.Compact, Stretch = Stretch.Uniform,
+                },
+                Padding = new Thickness(6, 2),
+            };
+            ToolTip.SetTip(remove, "Remove marker");
+            remove.Click += (_, _) => { _timeline?.RemoveMarker(captured); if (this.FindControl<Button>("MarkersButton")?.Flyout is Flyout f) f.Content = BuildMarkersPanel(); };
+            Grid.SetColumn(remove, 2);
+            row.Children.Add(remove);
+
+            list.Children.Add(row);
+        }
+
+        root.Children.Add(new ScrollViewer
+        {
+            MaxHeight = 280, Content = list, HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled,
+        });
+        return root;
+    }
+
+    // ── Context-enabling: refresh menu items on submenu open ────────────────────────────────────────
+
+    private void RefreshEditMenu()
+    {
+        bool sel = _timeline?.HasSelection == true;
+        if (_cutMenuItem is not null) _cutMenuItem.IsEnabled = sel;
+        if (_copyMenuItem is not null) _copyMenuItem.IsEnabled = sel;
+        if (_pasteMenuItem is not null) _pasteMenuItem.IsEnabled = _timeline?.CanPaste == true;
+        if (_deleteMenuItem is not null) _deleteMenuItem.IsEnabled = sel;
+        if (_rippleDeleteMenuItem is not null) _rippleDeleteMenuItem.IsEnabled = sel;
+        if (_selectAllMenuItem is not null) _selectAllMenuItem.IsEnabled = _timeline?.CanSelectAll == true;
+    }
+
+    private void RefreshClipMenu()
+    {
+        bool sel = _timeline?.HasSelection == true;
+        if (_clipSplitMenuItem is not null) _clipSplitMenuItem.IsEnabled = _timeline?.CanSplitAtPlayhead == true;
+        if (_clipDuplicateMenuItem is not null) _clipDuplicateMenuItem.IsEnabled = sel;
+        if (_clipEnableMenuItem is not null)
+        {
+            _clipEnableMenuItem.IsEnabled = sel;
+            _clipEnableMenuItem.IsChecked = _timeline?.SelectedIsEnabled == true;
+        }
+        if (_linkMenuItem is not null) _linkMenuItem.IsEnabled = _timeline?.CanLinkSelection == true;
+        if (_unlinkMenuItem is not null) _unlinkMenuItem.IsEnabled = _timeline?.SelectedIsLinked == true;
+        if (_nudgeLeftMenuItem is not null) _nudgeLeftMenuItem.IsEnabled = sel;
+        if (_nudgeRightMenuItem is not null) _nudgeRightMenuItem.IsEnabled = sel;
+        if (_clipSpeedMenuItem is not null) _clipSpeedMenuItem.IsEnabled = sel;
+        if (_createMulticamMenuItem is not null) _createMulticamMenuItem.IsEnabled = _timeline?.CanCreateMulticam == true;
+        if (_clipNormalizeMenuItem is not null) _clipNormalizeMenuItem.IsEnabled = SelectedClipHasAudio();
+        if (_clipInterpretFootageMenuItem is not null) _clipInterpretFootageMenuItem.IsEnabled = SelectedClipVideoMedia() is not null;
+        // Frame hold (PLAN.md step 43): enabled for a video clip with frame content; the stop-motion frame
+        // edits act on the source-frame grid, so they need an unheld clip (a hold has no frame grid).
+        bool canHold = _timeline?.SelectedCanFrameHold == true;
+        bool held = _timeline?.SelectedIsHeld == true;
+        if (_clipFrameHoldOptionsMenuItem is not null) _clipFrameHoldOptionsMenuItem.IsEnabled = canHold;
+        if (_clipAddFrameHoldMenuItem is not null) _clipAddFrameHoldMenuItem.IsEnabled = canHold && !held;
+        if (_clipInsertFrameHoldSegmentMenuItem is not null) _clipInsertFrameHoldSegmentMenuItem.IsEnabled = canHold && !held;
+        if (_clipDuplicateFrameMenuItem is not null) _clipDuplicateFrameMenuItem.IsEnabled = canHold && !held;
+        if (_clipRemoveFrameMenuItem is not null) _clipRemoveFrameMenuItem.IsEnabled = canHold && !held;
+    }
+
+    /// <summary>
+    /// Builds and opens the clip right-click context menu (PLAN.md step 53), mirroring the grouping used by leading editors:
+    /// Cut / Copy / Paste / Duplicate · Delete / Ripple Delete · Split at Playhead · Enable / Unlink / Link ·
+    /// Speed/Duration / Frame Hold ▸ · Nest / Normalize Audio / Interpret Footage / Multicam ▸. Built
+    /// imperatively per open (the <see cref="MediaBrowserPanel"/> idiom) reusing the menu-bar handlers and the
+    /// same enablement predicates <see cref="RefreshClipMenu"/>/<see cref="RefreshEditMenu"/> use, evaluated at
+    /// build time — the menu is rebuilt on every open, so no refresh plumbing is needed. The menu is shaped by
+    /// the clip's lane kind, as leading editors shape their clip menus: video-only items (Frame Hold ▸, Interpret
+    /// Footage, Multicam ▸) appear only on a video-track clip, and Normalize Audio only on an audio-track clip —
+    /// on a linked pair the video clip contributes no audio (its companion does), so audio items on it would be
+    /// silent no-ops. Linkedness itself never changes the item set, only what the operations act on (split /
+    /// duplicate / enable / delete take the whole group when Linked is on). Link enables for a multi-selection
+    /// spanning video + audio (PLAN.md step 55). The timeline has already selected
+    /// <paramref name="clip"/> before raising the event.
+    /// </summary>
+    private void ShowClipContextMenu(Clip clip, Sprocket.Core.Model.Track track)
+    {
+        if (_timeline is not { } timeline)
+            return;
+        bool isVideoLane = track is VideoTrack;
+
+        static MenuItem Item(string header, Action action, bool enabled = true, KeyGesture? gesture = null)
+        {
+            var item = new MenuItem { Header = header, IsEnabled = enabled, InputGesture = gesture };
+            item.Click += (_, _) => action();
+            return item;
+        }
+
+        var enableItem = new MenuItem
+        {
+            Header = "_Enable",
+            ToggleType = MenuItemToggleType.CheckBox,
+            IsChecked = timeline.SelectedIsEnabled,
+            InputGesture = KeyGesture.Parse("Shift+E"),
+        };
+        enableItem.Click += (_, _) => timeline.ToggleSelectedEnabled();
+
+        var items = new System.Collections.Generic.List<Control>
+        {
+            Item("Cu_t", timeline.CutSelected, gesture: _cutMenuItem?.InputGesture),
+            Item("_Copy", timeline.CopySelected, gesture: _copyMenuItem?.InputGesture),
+            Item("_Paste", timeline.PasteAtPlayhead, timeline.CanPaste, _pasteMenuItem?.InputGesture),
+            Item("Du_plicate", timeline.DuplicateSelected),
+            new Separator(),
+            Item("_Delete", timeline.DeleteSelected, gesture: KeyGesture.Parse("Delete")),
+            Item("_Ripple Delete", timeline.RippleDeleteSelected, gesture: KeyGesture.Parse("Shift+Delete")),
+            new Separator(),
+            Item("Spli_t at Playhead", timeline.SplitAtPlayhead, timeline.CanSplitAtPlayhead,
+                _clipSplitMenuItem?.InputGesture),
+            new Separator(),
+            enableItem,
+            Item("_Unlink", timeline.UnlinkSelected, timeline.SelectedIsLinked, _unlinkMenuItem?.InputGesture),
+            Item("_Link", timeline.LinkSelected, timeline.CanLinkSelection, _linkMenuItem?.InputGesture),
+            new Separator(),
+            Item("_Speed / Duration…", () => _ = ShowSpeedDialogAsync()),
+            Item(timeline.SelectedClipReverse ? "Play For_ward" : "Re_verse Speed", timeline.ToggleSelectedReverse,
+                timeline.SelectedCanReverse),
+        };
+
+        if (isVideoLane)
+        {
+            // Frame hold + stop-motion frame edits (PLAN.md step 43) — the Clip-menu items' handlers and
+            // enablement. Video lanes only: a hold freezes a frame, which an audio clip doesn't have.
+            bool canHold = timeline.SelectedCanFrameHold;
+            bool held = timeline.SelectedIsHeld;
+            items.Add(new MenuItem
+            {
+                Header = "Frame _Hold",
+                ItemsSource = new[]
+                {
+                    Item("Frame Hold _Options…", () => _ = ShowFrameHoldOptionsAsync(), canHold),
+                    Item("_Add Frame Hold", timeline.AddFrameHoldAtPlayhead, canHold && !held),
+                    Item("Insert Frame Hold Se_gment", timeline.InsertFrameHoldSegmentAtPlayhead, canHold && !held),
+                    Item("_Duplicate Frame", timeline.DuplicateFrameAtPlayhead, canHold && !held),
+                    Item("Remo_ve Frame", timeline.RemoveFrameAtPlayhead, canHold && !held),
+                },
+            });
+        }
+
+        items.Add(new Separator());
+        items.Add(Item("_Nest", NestSelection));
+
+        if (isVideoLane)
+        {
+            items.Add(Item("Interpret _Footage…", InterpretSelectedClipFootage, SelectedClipVideoMedia() is not null));
+
+            // Multicam (PLAN.md step 24): Create mirrors the Clip menu; on a multicam clip the angles are listed
+            // (the active one checked) so a right-click can switch without the 1–9 keys or the Inspector.
+            var multicamItems = new System.Collections.Generic.List<MenuItem>
+            {
+                Item("Create _Multicam Source", CreateMulticamSource, timeline.CanCreateMulticam),
+            };
+            if (timeline.SelectedIsMulticam && _project is not null && clip.SourceMulticamId is { } multicamId
+                && _project.MulticamSources.Find(s => s.Id == multicamId) is { } multicamSource)
+            {
+                for (int i = 0; i < multicamSource.Angles.Count; i++)
+                {
+                    int angle = i;
+                    var angleItem = new MenuItem
+                    {
+                        Header = string.IsNullOrEmpty(multicamSource.Angles[i].Name)
+                            ? $"Angle {i + 1}"
+                            : multicamSource.Angles[i].Name,
+                        ToggleType = MenuItemToggleType.Radio,
+                        IsChecked = clip.ActiveAngle == i,
+                    };
+                    angleItem.Click += (_, _) => timeline.SwitchSelectedAngle(angle);
+                    multicamItems.Add(angleItem);
+                }
+            }
+            items.Add(new MenuItem { Header = "M_ulticam", ItemsSource = multicamItems });
+        }
+        else
+        {
+            // Audio lanes only: on a linked pair the audio companion is where gain acts — normalizing the
+            // video clip's GainDb would be a silent no-op (video-track clips contribute no audio).
+            items.Add(Item("N_ormalize Audio", NormalizeSelectedClip, SelectedClipHasAudio()));
+        }
+
+        // This menu is opened detached (not set as a control's ContextMenu property), so Avalonia won't
+        // auto-close a previous one — close it ourselves so repeated right-clicks never stack menus.
+        _clipContextMenu?.Close();
+        var menu = new ContextMenu { Placement = PlacementMode.Pointer, ItemsSource = items };
+        menu.Closed += (_, _) => { if (ReferenceEquals(_clipContextMenu, menu)) _clipContextMenu = null; };
+        _clipContextMenu = menu;
+        menu.Open(timeline);
+    }
+
+    /// <summary>Whether the timeline selection is a clip whose source carries audio (so Clip ▸ Normalize Audio can act).</summary>
+    private bool SelectedClipHasAudio() =>
+        _project is not null && _selectedClip is { } clip && clip.Kind == ClipKind.Media
+        && _project.MediaPool.Get(clip.MediaRefId) is { Info.HasAudio: true };
+
+    /// <summary>The video-bearing source of the selected media clip, or <see langword="null"/> — so Clip ▸ Interpret
+    /// Footage enables and acts only when the selection references reinterpretable video (PLAN.md step 42).</summary>
+    private MediaRef? SelectedClipVideoMedia() =>
+        _project is not null && _selectedClip is { Kind: ClipKind.Media } clip
+        && _project.MediaPool.Get(clip.MediaRefId) is { Info.HasVideo: true } media
+            ? media
+            : null;
+
+    /// <summary>Clip ▸ Interpret Footage (PLAN.md step 42): reinterpret the selected clip's source frame rate,
+    /// the same command the media-bin tile menu runs.</summary>
+    private void InterpretSelectedClipFootage()
+    {
+        if (SelectedClipVideoMedia() is { } media)
+            _ = InterpretFootageAsync(media);
+    }
+
+    /// <summary>
+    /// Clip ▸ Normalize Audio (PLAN.md step 30): measures the selected clip's raw loudness over its used source span
+    /// and sets its <see cref="Clip.GainDb"/> so it hits the mixer's target (true-peak limited), as one undoable
+    /// edit. Applying it to several clips in turn matches their loudness (the gain-match pass).
+    /// </summary>
+    private void NormalizeSelectedClip()
+    {
+        if (_project is null || _selectedClip is not { } clip || !SelectedClipHasAudio())
+            return;
+
+        using IPcmReader? reader = MediaBootstrap.OpenPcmReaderFor(_project, clip.MediaRefId);
+        if (reader is null)
+        {
+            SetStatus("Cannot normalize: the clip's audio could not be opened.");
+            return;
+        }
+
+        Sprocket.Audio.Loudness.LoudnessMeasurement m = Sprocket.Audio.Loudness.LoudnessAnalyzer.MeasureSource(
+            reader, clip.SourceIn, clip.SourceOut - clip.SourceIn);
+        if (double.IsNegativeInfinity(m.IntegratedLufs))
+        {
+            SetStatus("Clip is silent — nothing to normalize.");
+            return;
+        }
+
+        double target = _mixer?.TargetLufs ?? LoudnessNormalization.StreamingMinus14Lufs;
+        double gain = LoudnessNormalization.ComputeGainDb(m.IntegratedLufs, m.TruePeakDbtp, target);
+        _history.Execute(SetPropertyCommand<double>.Create(
+            "Normalize clip audio", () => clip.GainDb, v => clip.GainDb = v, gain));
+        SetStatus($"Normalized clip to {target:0.#} LUFS ({MixerFormat.GainDbLabel(gain)}).");
+    }
+
+    /// <summary>Rebuilds the Effects menu for the current selection: only the effects relevant to the selected
+    /// clip's track kind (audio DSP vs video/colour shaders, <see cref="EffectRelevance"/>), disabled when
+    /// nothing is selected. Rebuilt on every open so plugin registrations and selection changes are honoured.</summary>
+    private void RefreshEffectsMenu()
+    {
+        if (_effectsMenu is null)
+            return;
+        Clip? selected = _timeline?.SelectedClip;
+        var items = new System.Collections.Generic.List<MenuItem>();
+        System.Collections.Generic.IEnumerable<EffectDescriptor> effects =
+            selected is not null && _project is not null
+                ? EffectRelevance.For(_project.Timeline, selected)
+                : EffectCatalog.All;
+        foreach (EffectDescriptor descriptor in effects)
+        {
+            string id = descriptor.Id; // capture per iteration
+            var item = new MenuItem { Header = descriptor.DisplayName, IsEnabled = selected is not null };
+            item.Click += (_, _) => _timeline?.ApplyEffectToSelected(id);
+            items.Add(item);
+        }
+        _effectsMenu.ItemsSource = items;
+    }
+
+    /// <summary>Clip ▸ Speed / Duration (PLAN.md step 21): prompts for a speed percentage + direction and retimes
+    /// the selected clip (and its linked companions) through the command stack. A constant speed from the dialog
+    /// replaces any keyframed speed ramp, as in leading editors.</summary>
+    private async Task ShowSpeedDialogAsync()
+    {
+        if (_timeline is not { HasSelection: true } timeline)
+            return;
+        SpeedDialogResult? result = await SpeedDialog.Show(
+            this, timeline.SelectedClipSpeed, timeline.SelectedClipReverse, timeline.SelectedClipHasRamp, timeline.SelectedCanReverse);
+        if (result is { } r)
+        {
+            timeline.SetSelectedClipSpeed(r.Speed, r.Reverse);
+            SetStatus($"Clip speed set to {(r.Speed.ToDouble() * 100):0.##}%{(r.Reverse ? ", reversed" : "")}.");
+        }
+    }
+
+    /// <summary>Clip ▸ Frame Hold Options (PLAN.md step 43, naming used by leading editors): freeze the whole selected clip on
+    /// one source frame — at its in point, the playhead frame, or an explicit source time — or release the hold.
+    /// The clip's timeline span never changes; un-holding restores normal playback exactly.</summary>
+    private async Task ShowFrameHoldOptionsAsync()
+    {
+        if (_timeline is not { SelectedCanFrameHold: true } timeline || timeline.SelectedClip is not { } clip
+            || _project is null)
+            return;
+
+        string name = clip.Kind == ClipKind.Media
+            ? System.IO.Path.GetFileName(_project.MediaPool.Get(clip.MediaRefId)?.AbsolutePath ?? "clip")
+            : "Selected clip";
+        FrameHoldOptionsResult? result = await FrameHoldOptionsDialog.Show(
+            this, name, clip.IsHeld, clip.HoldFrameAt, clip.SourceIn, timeline.SelectedClipSourceAtPlayhead);
+        if (result is null)
+            return;
+
+        if (!result.Hold)
+        {
+            if (clip.IsHeld)
+            {
+                timeline.UnholdSelectedClip();
+                SetStatus("Frame hold removed.");
+            }
+            return;
+        }
+        if (clip.IsHeld && clip.HoldFrameAt == result.HoldAt)
+            return; // nothing changed — keep the undo history clean
+        timeline.HoldSelectedClip(result.HoldAt);
+        SetStatus($"Clip held on the frame at {result.HoldAt.ToSeconds():0.###} s.");
+    }
+
+    private void RefreshViewMenu()
+    {
+        if (_snappingMenuItem is not null) _snappingMenuItem.IsChecked = _snappingToggle?.IsChecked == true;
+        if (_guidesMenuItem is not null) _guidesMenuItem.IsChecked = _guidesToggle?.IsChecked == true;
+        if (_showProjectMenuItem is not null) _showProjectMenuItem.IsChecked = _projectPane?.IsVisible != false;
+        if (_showInspectorMenuItem is not null) _showInspectorMenuItem.IsChecked = _inspectorPane?.IsVisible != false;
+        if (_showStatsMenuItem is not null) _showStatsMenuItem.IsChecked = _statsOverlay is not null;
+        if (_showProxyStatusMenuItem is not null) _showProxyStatusMenuItem.IsChecked = _proxyWindow is not null;
+        if (_fullScreenMenuItem is not null) _fullScreenMenuItem.IsChecked = WindowState == WindowState.FullScreen;
+        // The timeline owns the mode; re-check the matching item rather than trusting the radio group's own state.
+        TimelineAutoScroll autoScroll = _timeline?.AutoScroll ?? TimelineAutoScroll.Page;
+        if (_autoScrollNoneMenuItem is not null) _autoScrollNoneMenuItem.IsChecked = autoScroll == TimelineAutoScroll.None;
+        if (_autoScrollPageMenuItem is not null) _autoScrollPageMenuItem.IsChecked = autoScroll == TimelineAutoScroll.Page;
+        if (_autoScrollSmoothMenuItem is not null) _autoScrollSmoothMenuItem.IsChecked = autoScroll == TimelineAutoScroll.Smooth;
+    }
+
+    /// <summary>
+    /// View ▸ Playback Auto-Scroll: sets how the timeline follows the playhead during playback and persists the
+    /// choice, so it survives a restart the way Premiere's equivalent preference does.
+    /// </summary>
+    private void SetAutoScroll(TimelineAutoScroll mode)
+    {
+        if (_timeline is not null)
+            _timeline.AutoScroll = mode;
+        if (UserSettingsStore.ParseAutoScroll(_userSettings.TimelineAutoScroll) == mode)
+            return;
+        _userSettings = _userSettings with { TimelineAutoScroll = mode.ToString() };
+        UserSettingsFile.Save(_userSettings);
+    }
+
+    /// <summary>
+    /// View ▸ Playback Statistics: opens or closes the floating diagnostics overlay (effective vs. target frame
+    /// rate, dropped frames, CPU / memory / GC). The overlay polls whichever monitor's engine is active, so it
+    /// reflects the Program timeline or a Source preview as the user switches tabs. Non-modal and always-on-top.
+    /// </summary>
+    private void ShowStatsOverlay(bool show)
+    {
+        if (show)
+        {
+            if (_statsOverlay is not null)
+                return;
+            var overlay = new PlaybackStatsOverlay(() => _active?.CurrentEngine ?? _engine);
+            overlay.Closed += (_, _) =>
+            {
+                _statsOverlay = null;
+                if (_showStatsMenuItem is not null)
+                    _showStatsMenuItem.IsChecked = false;
+            };
+            _statsOverlay = overlay;
+            overlay.Show(this);   // non-modal child window
+            overlay.PlaceNear(this);
+        }
+        else
+        {
+            _statsOverlay?.Close(); // Closed handler clears the field + unchecks the menu item
+        }
+    }
+
+    /// <summary>
+    /// View ▸ Proxy (PLAN.md step 18): opens or closes the proxy status + control window — per-asset state with live
+    /// progress and ETA, plus the on/off, resolution-tier, pause/resume and delete controls (Final Cut Pro's
+    /// Background Tasks window, and its delete-generated-media commands, in one place). Non-modal so it can stay open
+    /// while editing; a single instance.
+    /// </summary>
+    /// <remarks>The two <em>settings</em> it exposes are project state, so they route back through
+    /// <see cref="ProxySettingsOps"/> + <see cref="_history"/> rather than being set directly: that keeps them
+    /// undoable and marks the document dirty, which is what makes them survive a save/reload. The service transition
+    /// happens inside the command's setter, so undo/redo reconfigures the live service too.</remarks>
+    private void ShowProxyWindow(bool show)
+    {
+        if (show)
+        {
+            if (_proxyWindow is not null)
+                return;
+            if (_proxy is null || _project is null)
+            {
+                if (_showProxyStatusMenuItem is not null)
+                    _showProxyStatusMenuItem.IsChecked = false;
+                return;
+            }
+
+            ProjectSettings settings = _project.Settings;
+            var window = new ProxyStatusWindow(
+                _proxy, _project,
+                enabled =>
+                {
+                    if (ProxySettingsOps.BuildEnableCommand(settings, _proxy.SetEnabled, enabled) is { } command)
+                        _history.Execute(command);
+                },
+                tier =>
+                {
+                    if (ProxySettingsOps.BuildTierCommand(settings, _proxy.SetTier, tier) is { } command)
+                        _history.Execute(command);
+                });
+            window.Closed += (_, _) =>
+            {
+                _proxyWindow = null;
+                if (_showProxyStatusMenuItem is not null)
+                    _showProxyStatusMenuItem.IsChecked = false;
+            };
+            _proxyWindow = window;
+            window.Show(this); // non-modal child window
+        }
+        else
+        {
+            _proxyWindow?.Close(); // Closed handler clears the field + unchecks the menu item
+        }
+    }
+
+    // ── View / Window: panel visibility + layout ────────────────────────────────────────────────────
+
+    /// <summary>Shows or hides the Project (left) or Inspector (right) pane by collapsing its column + splitter.</summary>
+    private void SetPanelVisible(bool project, bool visible)
+    {
+        if (_workspaceGrid is null)
+            return;
+        if (project)
+        {
+            if (_projectPane is not null) _projectPane.IsVisible = visible;
+            if (_projectSplitter is not null) _projectSplitter.IsVisible = visible;
+            _workspaceGrid.ColumnDefinitions[0].Width = visible ? new GridLength(240) : new GridLength(0);
+            _workspaceGrid.ColumnDefinitions[1].Width = visible ? new GridLength(6) : new GridLength(0);
+        }
+        else
+        {
+            if (_inspectorPane is not null) _inspectorPane.IsVisible = visible;
+            if (_inspectorSplitter is not null) _inspectorSplitter.IsVisible = visible;
+            _workspaceGrid.ColumnDefinitions[4].Width = visible ? new GridLength(300) : new GridLength(0);
+            // The column's 192px floor (declared in XAML) would block collapsing to 0 — lift it while hidden.
+            _workspaceGrid.ColumnDefinitions[4].MinWidth = visible ? 192 : 0;
+            _workspaceGrid.ColumnDefinitions[3].Width = visible ? new GridLength(6) : new GridLength(0);
+        }
+
+        // Hiding the pane that owns the work-area focus ring would leave the active-area affordance stranded on
+        // an off-screen pane; hand the ring on to the next available area instead.
+        WorkArea hidden = project ? WorkArea.Project : WorkArea.Inspector;
+        if (!visible && _activeArea == hidden)
+            FocusWorkArea(WorkAreaFocus.Advance(hidden, forward: true, IsWorkAreaAvailable));
+    }
+
+    /// <summary>Window ▸ Reset Layout: restore the pane splitters to their default sizes and show all panes.</summary>
+    private void ResetLayout()
+    {
+        if (_workspaceGrid is not null)
+        {
+            _workspaceGrid.ColumnDefinitions[0].Width = new GridLength(240);
+            _workspaceGrid.ColumnDefinitions[1].Width = new GridLength(6);
+            _workspaceGrid.ColumnDefinitions[2].Width = new GridLength(1, GridUnitType.Star);
+            _workspaceGrid.ColumnDefinitions[3].Width = new GridLength(6);
+            _workspaceGrid.ColumnDefinitions[4].Width = new GridLength(300);
+        }
+        if (_outerGrid is not null)
+            _outerGrid.RowDefinitions[2].Height = new GridLength(240);
+        SetPanelVisible(project: true, true);
+        SetPanelVisible(project: false, true);
+        SetStatus("Layout reset.");
+    }
+
+    // ── Edit-history reactions: menu enable + dirty indicator ───────────────────────────────────────
+
+    private void OnHistoryChanged()
+    {
+        // Undoing a sequence-add (or a removal's redo) can strip the sequence that is currently open. Switching the
+        // active sequence is navigation, not part of the command (ARCHITECTURE.md §17), so heal it here: fall back
+        // to a surviving sequence so the editor never points at one no longer in the project (PLAN.md step 23).
+        if (_project is { } project && !project.Sequences.Contains(project.ActiveSequence) && project.Sequences.Count > 0)
+            SwitchToSequence(project.Sequences[^1]);
+
+        // A Sequence Settings frame-size edit (and its undo/redo) changes the active sequence's resolution without
+        // switching sequences, so reconcile the Program monitor here rather than only at Apply time — this one spot
+        // keeps Apply, Undo, and Redo all consistent. The repaint below (InvalidateVisual) shows the new canvas.
+        if (_project is { } p && _program is { } program)
+        {
+            Resolution res = p.ActiveSequence.Timeline.Resolution;
+            if (program.FrameWidth != res.Width || program.FrameHeight != res.Height)
+            {
+                program.SetFrameSize(res.Width, res.Height);
+                if (_active is not null && ReferenceEquals(_active, program))
+                    _preview?.SetFrameSize(res.Width, res.Height);
+            }
+        }
+
+        _undoMenuItem!.IsEnabled = _history.CanUndo;
+        _redoMenuItem!.IsEnabled = _history.CanRedo;
+        _undoMenuItem.Header = _history.CanUndo ? $"_Undo {_history.UndoLabel}" : "_Undo";
+        _redoMenuItem.Header = _history.CanRedo ? $"_Redo {_history.RedoLabel}" : "_Redo";
+
+        bool dirty = IsDirty;
+        _saveStateText!.Text = dirty ? "• unsaved changes" : "• all changes saved";
+        UpdateTimelineHeader();
+        RefreshKeyframeNav(); // a keyframe just added/removed on the selection toggles the jump buttons
+
+        // A timeline edit (placement, trim, delete) can change the overall duration, so re-point the scrubber
+        // range / duration readout. Only the Program monitor reflects the timeline; the Source monitor spans
+        // its own media. (_active is non-null only once the transport is wired.)
+        if (_active is not null && ReferenceEquals(_active, _program))
+            RefreshTransportForActive();
+
+        // Refresh the monitor for edits that only change how the current frame composites — a track's visibility
+        // (the eye toggle), an effect parameter (a Color/Brightness slider drag), opacity/blend. While playing the
+        // pump repaints every frame, but while paused it only presents on a decode or a seek, so these edits would
+        // otherwise not show until the next scrub/play. The surface recomposites from live model state on each draw
+        // (it honours track.Enabled and resolves each clip's effects at the playhead) over the already-held native
+        // frames, so a repaint alone reflects the edit with no re-decode. (Null until the transport is wired.)
+        _preview?.InvalidateVisual();
+
+        // Render cache (PLAN.md step 32): every model edit may invalidate (or, on undo, re-validate) cached
+        // ranges. Re-hashing per Changed would run once per mutation during a drag, so debounce it.
+        ScheduleRenderCacheRefresh();
+    }
+
+    // ── Sequences: multiple sequences + nested/compound clips (PLAN.md step 23) ─────────────────────
+
+    /// <summary>Sequence ▸ New Sequence: opens the format picker (name + frame-size presets incl. portrait,
+    /// seeded from the active sequence; frame rate / sample rate are cloned), then creates the fresh empty
+    /// sequence (one video + one audio track) through the command stack and opens it. Mirrors the File ▸ New ▸
+    /// Sequence dialog flow in leading editors, which makes the new sequence the active one.</summary>
+    private async Task NewSequenceAsync()
+    {
+        if (_project is null)
+            return;
+
+        Timeline current = _project.Timeline;
+        string suggested = SequenceNaming.NextUnique(_project, "Sequence");
+        if (await SequenceSettingsDialog.ShowNew(this, suggested, current) is not { } result)
+            return;
+
+        var timeline = new Timeline(current.FrameRate, result.Resolution, current.SampleRate);
+        timeline.Tracks.Add(new VideoTrack { Name = "V1" });
+        timeline.Tracks.Add(new AudioTrack { Name = "A1" });
+        // The dialog's suggested name is unique, but the user can type anything — re-uniquify a clash.
+        string name = _project.Sequences.Any(s => string.Equals(s.Name, result.Name, StringComparison.OrdinalIgnoreCase))
+            ? SequenceNaming.NextUnique(_project, result.Name)
+            : result.Name;
+        var sequence = new Sequence(SequenceId.New(), name, timeline);
+
+        _history.Execute(new AddSequenceCommand(_project, sequence));
+        SwitchToSequence(sequence);
+        SetStatus($"New sequence: {sequence.Name}");
+    }
+
+    /// <summary>Sequence ▸ Nest: nests the timeline selection (with its linked companions) into a new child
+    /// sequence (PLAN.md step 23). The heavy lifting is the tested <see cref="Core.Model.SequenceNesting"/>; this
+    /// just routes it and reports. A no-op when nothing is selected.</summary>
+    private void NestSelection()
+    {
+        if (_timeline?.NestSelection() is { } child)
+            SetStatus($"Nested selection into {child.Name}");
+    }
+
+    /// <summary>Clip ▸ Create Multicam Source: collapses the stacked video angles into one synced multicam clip
+    /// (PLAN.md step 24). The work is the tested <see cref="Core.Model.MulticamBuilder"/>; this routes it and
+    /// reports. Switch angles afterwards with the 1–9 keys or the Inspector.</summary>
+    private void CreateMulticamSource()
+    {
+        if (_timeline?.CreateMulticamSource() is { } name)
+            SetStatus($"Created {name} — press 1–9 to switch angle at the playhead");
+    }
+
+    /// <summary>
+    /// Opens a sequence in the timeline in place (PLAN.md step 23): re-points the model's active sequence, re-points
+    /// the Program monitor + preview at its (possibly different) resolution, and rewinds so the engine's pump
+    /// reconciles its per-track players onto the new sequence's tracks. The edit history is shared across sequences,
+    /// so undo/redo keeps working after a switch. <paramref name="sequence"/> must be one of the project's sequences.
+    /// </summary>
+    private void SwitchToSequence(Sequence sequence)
+    {
+        if (_project is null || ReferenceEquals(_project.ActiveSequence, sequence))
+            return;
+
+        _project.ActiveSequence = sequence; // throws if not a member; callers only pass project sequences
+
+        Resolution res = sequence.Timeline.Resolution;
+        _program?.SetFrameSize(res.Width, res.Height);
+        _engine?.SeekTo(Timecode.Zero); // pump reconciles players to the new tracks and presents frame 0
+        if (_active is not null && ReferenceEquals(_active, _program))
+        {
+            BindActiveToSurface();
+            RefreshTransportForActive();
+        }
+
+        _timeline?.OnActiveSequenceChanged(); // drop the (old-sequence) selection + repaint on the new timeline
+        if (_timeline is not null)
+        {
+            _timeline.MarkIn = null;  // in/out marks are per-sequence UI state; the old range is meaningless here
+            _timeline.MarkOut = null;
+        }
+        UpdateSequenceBadge();
+        UpdateTelemetry();
+        UpdateTimelineHeader();
+        RefreshRenderCache(); // the render bar + playable cached segments follow the active sequence (step 32)
+    }
+
+    /// <summary>On Sequence-menu open: enables Nest only with a selection, and (re)builds the Open Sequence
+    /// submenu listing every sequence with the active one checked (PLAN.md step 23).</summary>
+    private void RefreshSequenceMenu()
+    {
+        if (_nestMenuItem is not null)
+            _nestMenuItem.IsEnabled = _timeline?.HasSelection == true;
+
+        if (_openSequenceMenuItem is null || _project is null)
+            return;
+
+        var items = new List<MenuItem>(_project.Sequences.Count);
+        foreach (Sequence seq in _project.Sequences)
+        {
+            Sequence captured = seq; // capture per iteration
+            var item = new MenuItem
+            {
+                Header = seq.Name,
+                ToggleType = MenuItemToggleType.CheckBox,
+                IsChecked = ReferenceEquals(seq, _project.ActiveSequence),
+            };
+            item.Click += (_, _) => SwitchToSequence(captured);
+            items.Add(item);
+        }
+        _openSequenceMenuItem.ItemsSource = items;
+        _openSequenceMenuItem.IsEnabled = items.Count > 0;
+
+        // Render cache commands (PLAN.md step 32): Render Selection needs a selected clip, and Delete Render
+        // Files shows the cache's current disk footprint so the user sees what deleting reclaims.
+        if (_renderSelectionMenuItem is not null)
+            _renderSelectionMenuItem.IsEnabled = _selectedClip is not null && _renderCache is not null;
+
+        // Audio freeze (PLAN.md step 41): Freeze needs a selected clip; Unfreeze additionally needs a valid
+        // cached audio segment covering that clip's range (i.e. the clip is actually frozen right now).
+        if (_freezeClipAudioMenuItem is not null)
+            _freezeClipAudioMenuItem.IsEnabled = _selectedClip is not null && _renderCache is not null;
+        if (_unfreezeClipAudioMenuItem is not null)
+        {
+            _unfreezeClipAudioMenuItem.IsEnabled =
+                _selectedClip is { } frozen && _renderCache is not null && _project is not null
+                && _renderCache.IsAudioRangeFrozen(_project.ActiveSequence.Id, frozen.TimelineStart, frozen.TimelineEnd);
+        }
+        if (_deleteRenderFilesMenuItem is not null)
+        {
+            long size = _renderCache?.SizeBytes() ?? 0;
+            _deleteRenderFilesMenuItem.Header = size > 0
+                ? $"_Delete Render Files… ({FormatBytes(size)})"
+                : "_Delete Render Files…";
+            _deleteRenderFilesMenuItem.IsEnabled = _renderCache is not null && size > 0;
+        }
+    }
+
+    // ── Preview render cache (PLAN.md step 32, ARCHITECTURE.md §20) ─────────────────────────────────
+
+    /// <summary>Schedules a debounced render-cache re-validation + render-bar refresh (a drag fires the history's
+    /// Changed once per mutation; one re-hash 250 ms after the last edit is enough).</summary>
+    private void ScheduleRenderCacheRefresh()
+    {
+        if (_renderCache is null)
+            return;
+        if (_renderCacheRefresh is null)
+        {
+            _renderCacheRefresh = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) };
+            _renderCacheRefresh.Tick += (_, _) =>
+            {
+                _renderCacheRefresh!.Stop();
+                RefreshRenderCache();
+            };
+        }
+        _renderCacheRefresh.Stop();
+        _renderCacheRefresh.Start();
+    }
+
+    /// <summary>Re-validates every cached segment against the current model (an invalidating edit turns its range
+    /// yellow/red; undoing it turns the range green again with no re-render) and repaints the render bar.</summary>
+    private void RefreshRenderCache()
+    {
+        _renderCache?.Refresh();
+        UpdateRenderBar();
+    }
+
+    /// <summary>Recomputes the timeline's render-bar spans: green over valid cached video, red over un-rendered
+    /// nested sequences / transitions, yellow over un-rendered effect-bearing content.</summary>
+    private void UpdateRenderBar()
+    {
+        if (_timeline is null || _project is null)
+            return;
+        var valid = new List<(Timecode, Timecode)>();
+        if (_renderCache is not null)
+        {
+            foreach ((Timecode segIn, Timecode segOut, RenderCacheScope scope, bool isValid) in _renderCache.SegmentsForActiveSequence())
+            {
+                if (scope == RenderCacheScope.Video && isValid)
+                    valid.Add((segIn, segOut));
+            }
+        }
+        _timeline.RenderSpans = RenderCache.RenderBarModel.Compute(_project.Timeline, valid);
+    }
+
+    /// <summary>Sets the timeline in (I) or out (O) mark at the Program playhead. Setting an in at/after the out
+    /// (or vice versa) drops the now-inconsistent other mark, so the range stays well-formed.</summary>
+    private void SetMarkAtPlayhead(bool inPoint)
+    {
+        if (_timeline is null || _engine is null)
+            return;
+        Timecode pos = _engine.Position;
+        if (inPoint)
+        {
+            _timeline.MarkIn = pos;
+            if (_timeline.MarkOut is { } markOut && markOut <= pos)
+                _timeline.MarkOut = null;
+            SetStatus($"In point set at {FormatTime(pos)}");
+        }
+        else
+        {
+            _timeline.MarkOut = pos;
+            if (_timeline.MarkIn is { } markIn && markIn >= pos)
+                _timeline.MarkIn = null;
+            SetStatus($"Out point set at {FormatTime(pos)}");
+        }
+    }
+
+    /// <summary>
+    /// Play In to Out (Ctrl+Shift+Space / the Sequence menu): plays the Program monitor from the in mark and stops
+    /// at the out mark — the dedicated ranged-play transport command of leading editors (Premiere's
+    /// Ctrl+Shift+Space, Avid's Play In to Out). A missing mark falls back to the sequence start/end (the same
+    /// fallback as Render In to Out), so with no marks it replays the whole sequence. Invoking it again restarts
+    /// from the in mark; plain Space stays unconstrained by the marks.
+    /// </summary>
+    private void PlayInToOut()
+    {
+        if (_engine is null || _project is null)
+            return;
+        Timecode duration = _project.ActiveSequence.Timeline.Duration;
+        if (duration <= Timecode.Zero)
+            return;
+        _engine.PlayInToOut(_timeline?.MarkIn ?? Timecode.Zero, _timeline?.MarkOut ?? duration);
+    }
+
+    /// <summary>Clears the timeline in (Alt+I) or out (Alt+O) mark.</summary>
+    private void ClearMark(bool inPoint)
+    {
+        if (_timeline is null)
+            return;
+        if (inPoint)
+            _timeline.MarkIn = null;
+        else
+            _timeline.MarkOut = null;
+        SetStatus(inPoint ? "In point cleared" : "Out point cleared");
+    }
+
+    /// <summary>
+    /// Sequence ▸ Render In to Out / Render Selection / Render Audio (PLAN.md step 32): pre-renders a range of the
+    /// active sequence to the cache — the composited video to a fast all-intra intermediate, or the master mix to
+    /// PCM — so playback replays it instead of recomputing every pass. The range is the in/out marks (falling back
+    /// to the whole sequence) or the selected clip's span. Quiesces every in-process decode pipeline first, exactly
+    /// as export does (a second concurrent libav* pipeline crashes the in-process muxer), renders on a background
+    /// task with a cancellable progress dialog, then resumes; the committed segment plays back immediately.
+    /// </summary>
+    private async Task RenderRangeAsync(RenderCacheScope scope, bool useSelection)
+    {
+        if (_rendering || _exporting || _project is null || _renderCache is null || _engine is null)
+            return;
+
+        Sequence sequence = _project.ActiveSequence;
+        Timecode duration = sequence.Timeline.Duration;
+        if (duration <= Timecode.Zero)
+        {
+            SetStatus("Nothing to render — the timeline is empty.");
+            return;
+        }
+
+        Timecode rangeIn, rangeOut;
+        if (useSelection)
+        {
+            if (_selectedClip is not { } clip)
+            {
+                SetStatus("Select a clip to render.");
+                return;
+            }
+            rangeIn = clip.TimelineStart;
+            rangeOut = clip.TimelineEnd;
+        }
+        else
+        {
+            rangeIn = _timeline?.MarkIn ?? Timecode.Zero;
+            rangeOut = _timeline?.MarkOut ?? duration;
+        }
+        if (rangeIn < Timecode.Zero)
+            rangeIn = Timecode.Zero;
+        if (rangeOut > duration)
+            rangeOut = duration;
+        if (rangeOut <= rangeIn)
+        {
+            SetStatus("Nothing to render — the range is empty.");
+            return;
+        }
+
+        int sampleRate = sequence.Timeline.SampleRate > 0 ? sequence.Timeline.SampleRate : 48000;
+        RenderCache.PendingRender pending = _renderCache.Prepare(
+            scope, sequence.Id, rangeIn, rangeOut,
+            scope == RenderCacheScope.Audio ? sampleRate : 0,
+            scope == RenderCacheScope.Audio ? 2 : 0);
+        if (_renderCache.IsAlreadyRendered(pending))
+        {
+            SetStatus("That range is already rendered.");
+            return;
+        }
+        string outputPath = _renderCache.FilePathFor(pending);
+        Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
+
+        _rendering = true;
+        SetEnabled(false); // same gating as export: no new in-process decode pipeline may start mid-render
+
+        bool sourceWasActive = ReferenceEquals(_active, _source);
+        _source?.Deactivate();
+        await _engine.SuspendAsync();
+
+        using var cts = new CancellationTokenSource();
+        string jobName = scope == RenderCacheScope.Audio
+            ? $"Audio render {FormatTime(rangeIn)}–{FormatTime(rangeOut)}"
+            : $"Preview render {FormatTime(rangeIn)}–{FormatTime(rangeOut)}";
+        var dialog = new ExportProgressDialog(jobName, cts);
+        var progress = new Progress<double>(p => dialog.SetProgress(p));
+        _ = dialog.ShowDialog(this); // modal; dismissed in the finally
+
+        bool ok = false;
+        bool cancelled = false;
+        string? error = null;
+        try
+        {
+            var range = new ExportRange(rangeIn, rangeOut);
+            await Task.Run(() =>
+            {
+                if (scope == RenderCacheScope.Audio)
+                    PreviewRenderer.RenderAudio(
+                        _project, sequence.Id, range, outputPath, PluginService.AudioEffectFactory, progress, cts.Token);
+                else
+                    PreviewRenderer.RenderVideo(_project, sequence.Id, range, outputPath, progress, cts.Token);
+            });
+            ok = true;
+        }
+        catch (OperationCanceledException)
+        {
+            cancelled = true; // PreviewRenderer deletes the partial file
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+        }
+        finally
+        {
+            dialog.CompleteAndClose();
+            _engine?.Resume();
+            if (sourceWasActive)
+                _source?.Activate();
+            _rendering = false;
+            SetEnabled(true);
+        }
+
+        if (ok)
+        {
+            _renderCache.Commit(pending); // playback picks the segment up on its next pump
+            UpdateRenderBar();
+            SetStatus($"Rendered {(scope == RenderCacheScope.Audio ? "audio " : "")}{FormatTime(rangeIn)}–{FormatTime(rangeOut)}");
+        }
+        else if (cancelled)
+        {
+            SetStatus("Render cancelled");
+        }
+        else
+        {
+            SetStatus($"Render failed: {error}");
+            await MessageDialog.Show(this, "Render Failed", $"The preview render could not be completed:\n{error}");
+        }
+    }
+
+    /// <summary>Sequence ▸ Unfreeze Clip Audio (PLAN.md step 41): forgets the cached audio segments intersecting
+    /// the selected clip's range so it mixes live again — the inverse of Freeze Clip Audio. The cache is a local
+    /// derived artifact, so this only ever costs a re-render, never project data (§20).</summary>
+    private void UnfreezeClipAudio()
+    {
+        if (_project is null || _renderCache is null || _selectedClip is not { } clip)
+            return;
+        int removed = _renderCache.RemoveAudioSegments(_project.ActiveSequence.Id, clip.TimelineStart, clip.TimelineEnd);
+        UpdateRenderBar();
+        SetStatus(removed > 0
+            ? $"Unfroze clip audio {FormatTime(clip.TimelineStart)}–{FormatTime(clip.TimelineEnd)} — mixing live again"
+            : "No frozen audio covers the selected clip.");
+    }
+
+    /// <summary>Sequence ▸ Delete Render Files… (PLAN.md step 32): confirms with the cache's location and current
+    /// disk footprint, then discards it — only ever forcing re-renders, never losing project data (§20).</summary>
+    private async Task DeleteRenderFilesAsync()
+    {
+        if (_renderCache is null)
+            return;
+
+        long size = _renderCache.SizeBytes();
+        if (size == 0)
+        {
+            SetStatus("No render files to delete.");
+            return;
+        }
+
+        bool confirmed = await ConfirmDialog.Show(this, "Delete Render Files",
+            $"Delete this project's preview render files?\n\n{_renderCache.Directory}\nCurrently using {FormatBytes(size)}.\n\n" +
+            "Rendered ranges will play live again until re-rendered; no project data is affected.",
+            "Delete", "Cancel");
+        if (!confirmed)
+            return;
+
+        long reclaimed = _renderCache.DeleteAll();
+        UpdateRenderBar();
+        SetStatus($"Deleted render files — reclaimed {FormatBytes(reclaimed)}");
+    }
+
+    /// <summary>A human disk size for the cache readout (binary units, one decimal from MB up).</summary>
+    private static string FormatBytes(long bytes) => bytes switch
+    {
+        >= 1L << 30 => $"{bytes / (double)(1L << 30):0.0} GB",
+        >= 1L << 20 => $"{bytes / (double)(1L << 20):0.0} MB",
+        >= 1L << 10 => $"{bytes / (double)(1L << 10):0} KB",
+        _ => $"{bytes} B",
+    };
+
+    /// <summary>Sequence ▸ Settings: edits the active sequence's name and frame size (Premiere's Sequence ▸
+    /// Sequence Settings). One dialog Apply is one undo entry (<see cref="SequenceSettingsOps.BuildCommand"/>
+    /// wraps a combined name + format change in a composite); the Program monitor follows the new frame size
+    /// through the history-Changed reconciliation, so undo/redo re-size it too.</summary>
+    private async Task ShowSequenceSettingsAsync()
+    {
+        if (_project is null)
+            return;
+
+        Sequence active = _project.ActiveSequence;
+        if (await SequenceSettingsDialog.ShowSettings(this, active) is not { } result
+            || SequenceSettingsOps.BuildCommand(active, result.Name, result.Resolution) is not { } command)
+            return;
+
+        _history.Execute(command);
+        UpdateSequenceBadge();
+        SetStatus($"Sequence settings applied — {active.Name}, {active.Timeline.Resolution.Width}×{active.Timeline.Resolution.Height}");
+    }
+
+    // ── Import ──────────────────────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Opens a file picker and imports the chosen media into the project's <see cref="Core.Model.MediaPool"/>
+    /// (PLAN.md step 16b). Each file is probed + added through the command stack (undoable); the bin refreshes
+    /// so the imported source's thumbnail/badges appear (step 15). OS file-drop onto the bin shares
+    /// <see cref="Import"/>.
+    /// </summary>
+    private async Task ImportDialogAsync()
+    {
+        if (_project is null)
+            return;
+
+        IReadOnlyList<IStorageFile> files = await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions
+        {
+            Title = "Import Media",
+            AllowMultiple = true,
+            FileTypeFilter =
+            [
+                new FilePickerFileType("Media files")
+                {
+                    Patterns = [.. VideoFileType.Patterns!, .. AudioFileType.Patterns!, .. ImageFileType.Patterns!],
+                },
+                VideoFileType,
+                AudioFileType,
+                ImageFileType,
+                FilePickerFileTypes.All,
+            ],
+        });
+
+        var paths = new List<string>();
+        foreach (IStorageFile file in files)
+            if (file.TryGetLocalPath() is { } path)
+                paths.Add(path);
+        if (paths.Count > 0)
+            await ImportAsync(paths);
+    }
+
+    /// <summary>
+    /// Imports the given paths into the project and refreshes the media bin (PLAN.md step 16b / step 42). An
+    /// image file with a detected contiguous numbered run prompts to import it as one image sequence (with a
+    /// frame-rate choice) or as a single still; other images import as stills at the preference default duration;
+    /// everything else imports as an ordinary file. Runs of one detected sequence are prompted once per batch.
+    /// </summary>
+    private async Task ImportAsync(IReadOnlyList<string> paths)
+    {
+        if (_project is null)
+            return;
+
+        Timecode stillDuration = Timecode.FromSeconds(_userSettings.StillImageDefaultSeconds);
+        var handledSequencePatterns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        int added = 0;
+        var failures = new List<(string Name, string Reason)>();
+        foreach (string path in paths)
+        {
+            MediaImport.Result result;
+            ImageSequenceInfo? seq = ImageSequenceDetection.IsImagePath(path) ? ImageSequenceDetection.Detect(path) : null;
+            if (seq is { } run)
+            {
+                // Skip siblings of a run already dealt with (imported or declined) in this batch — prompt only once.
+                if (handledSequencePatterns.Contains(run.Pattern))
+                    continue;
+                handledSequencePatterns.Add(run.Pattern);
+
+                (int w, int h) = TryProbeDimensions(path);
+                SequenceImportChoice? choice =
+                    await ImageSequenceImportDialog.Show(this, run, w, h, _project.Timeline.FrameRate);
+                if (choice is not { } c)
+                    continue; // cancelled — leave the whole run unimported
+                result = c.AsSequence
+                    ? MediaImport.TryImportSequence(_project, _history, run, c.FrameRate)
+                    : MediaImport.TryImport(_project, _history, path, stillDuration);
+            }
+            else
+            {
+                result = MediaImport.TryImport(_project, _history, path, stillDuration);
+            }
+
+            if (result.Succeeded)
+                added++;
+            else
+                failures.Add((Path.GetFileName(path), result.Error ?? "could not open"));
+        }
+
+        _mediaBrowser?.Refresh();
+        if (added > 0)
+            _proxy?.Enqueue(_project); // queue proxies for any newly-imported heavy sources (PLAN.md step 18)
+
+        if (failures.Count == 0)
+            SetStatus($"Imported {added} file{(added == 1 ? "" : "s")}.");
+        else if (paths.Count == 1)
+            SetStatus($"Could not import {failures[0].Name}: {failures[0].Reason}");
+        else
+        {
+            string detail = $"{failures[0].Name}: {failures[0].Reason}"
+                + (failures.Count > 1 ? $" (+{failures.Count - 1} more)" : "");
+            SetStatus($"Imported {added}, {failures.Count} failed — {detail}");
+        }
+    }
+
+    /// <summary>Interpret Footage (PLAN.md step 42): pick a new frame rate for a source and reinterpret it — the
+    /// media's rate/duration and every referencing clip's source span rescale so the same frames stay selected.
+    /// One undo entry. Refreshes the bin (badges/duration) and repaints the timeline (clip durations changed).</summary>
+    private async Task InterpretFootageAsync(MediaRef media)
+    {
+        if (_project is null)
+            return;
+        Rational? chosen = await InterpretFootageDialog.Show(this, Path.GetFileName(media.AbsolutePath), media.Info.FrameRate);
+        if (chosen is not { } newFps || newFps == media.Info.FrameRate)
+            return;
+
+        _history.Execute(ReinterpretFootageCommand.ForMedia(_project, media, newFps));
+        _mediaBrowser?.Refresh();
+        _timeline?.InvalidateVisual();
+        SetStatus($"Interpreted {Path.GetFileName(media.AbsolutePath)} at {newFps.Num}/{newFps.Den} fps.");
+    }
+
+    /// <summary>Best-effort probe of a single image's pixel dimensions for the sequence-import dialog (PLAN.md
+    /// step 42). Returns <c>(0, 0)</c> if the file can't be probed — the dialog then simply omits the size.</summary>
+    private static (int Width, int Height) TryProbeDimensions(string path)
+    {
+        try
+        {
+            ProbedMediaInfo info = Sprocket.Media.MediaSource.ProbeInfo(path);
+            return (info.Width, info.Height);
+        }
+        catch
+        {
+            return (0, 0);
+        }
+    }
+
+    // ── File ops (New / Open / Save / Save As) ──────────────────────────────────────────────────────
+
+    /// <summary>File ▸ New: after confirming any unsaved changes, requests a fresh empty project (one video +
+    /// one audio track) from the composition root (PLAN.md step 16c).</summary>
+    private async void NewProject()
+    {
+        if (BlockedByExport())
+            return;
+        if (!await ConfirmSaveIfDirtyAsync())
+            return;
+
+        var project = new Project();
+        project.Timeline.Tracks.Add(new VideoTrack { Name = "V1" });
+        project.Timeline.Tracks.Add(new AudioTrack { Name = "A1" });
+        SessionRequested?.Invoke(new SessionRequest(project, "New project", null));
+    }
+
+    /// <summary>
+    /// File ▸ Open Sample Project: after confirming any unsaved changes, builds a project over the demo clip
+    /// bundled next to the executable and requests a session over it (PLAN.md step 16c). The sample opens as an
+    /// untitled project — Save / Save As writes a fresh project file rather than touching the bundled clip. A
+    /// no-op with a status hint when the clip isn't present (e.g. a build that didn't copy the asset).
+    /// </summary>
+    private async void OpenSampleProject()
+    {
+        if (BlockedByExport())
+            return;
+        if (!await ConfirmSaveIfDirtyAsync())
+            return;
+
+        try
+        {
+            // Prefer the checked-in curated project (a graded timeline loaded through the normal ProjectSerializer
+            // path); its project-relative "sample.mp4" resolves against the bundled Samples folder. Fall back to
+            // building a plain project over the clip if only the clip shipped (or the project file is unreadable).
+            Project? project = LoadBundledSampleProject();
+            if (project is null && MediaBootstrap.SampleMediaPath() is { } clip)
+                project = MediaBootstrap.BuildProjectFromMedia(clip);
+            if (project is null)
+            {
+                SetStatus("Sample project is not available in this build.");
+                return;
+            }
+            SessionRequested?.Invoke(new SessionRequest(project, "Opened sample project", null));
+        }
+        catch (Exception ex)
+        {
+            SetStatus($"Could not open the sample project: {ex.Message}");
+        }
+    }
+
+    /// <summary>Loads the bundled sample project file, or <see langword="null"/> when it is absent or unreadable
+    /// (so the caller can fall back to a plain clip-only project). It opens as untitled — Save / Save As writes a
+    /// fresh file rather than touching the bundled asset.</summary>
+    private static Project? LoadBundledSampleProject()
+    {
+        if (MediaBootstrap.SampleProjectPath() is not { } projectPath)
+            return null;
+        try
+        {
+            return ProjectSerializer.Load(projectPath);
+        }
+        catch (Exception ex) when (ex is InvalidDataException or IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>File ▸ Open: after confirming unsaved changes, loads a project JSON and requests a session over
+    /// it. Load is offline-tolerant (§15); a parse/schema error is surfaced rather than thrown at the user.</summary>
+    private async Task OpenProjectAsync()
+    {
+        if (BlockedByExport())
+            return;
+        if (!await ConfirmSaveIfDirtyAsync())
+            return;
+
+        IReadOnlyList<IStorageFile> files = await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions
+        {
+            Title = "Open Project",
+            AllowMultiple = false,
+            FileTypeFilter = [SprocketProjectFileType, FilePickerFileTypes.All],
+        });
+        if (files.Count == 0 || files[0].TryGetLocalPath() is not { } path)
+            return;
+
+        try
+        {
+            bool recover = await ShouldRecoverAsync(path);
+            Project project;
+            string status;
+            if (recover)
+            {
+                // Load the newer autosave instead, resolving relative media against the project's own directory
+                // (the sidecar was written with the project path, so its relative paths match).
+                string autosavePath = Autosave.SidecarPath(path);
+                project = ProjectSerializer.Deserialize(
+                    File.ReadAllText(autosavePath), Path.GetDirectoryName(Path.GetFullPath(path)));
+                status = $"Recovered {Path.GetFileName(path)} from autosave";
+            }
+            else
+            {
+                project = ProjectSerializer.Load(path);
+                status = $"Opened {Path.GetFileName(path)}";
+            }
+            SessionRequested?.Invoke(new SessionRequest(project, status, path));
+        }
+        catch (Exception ex)
+        {
+            SetStatus($"Open failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Crash recovery (PLAN.md step 20): if a newer autosave sidecar sits beside the project being opened, ask
+    /// whether to recover it. The decision is the pure <see cref="AutosaveRecovery"/>; this just gathers the
+    /// filesystem timestamps and shows the prompt. Returns <c>true</c> to load the autosave instead.
+    /// </summary>
+    private async Task<bool> ShouldRecoverAsync(string projectPath)
+    {
+        string autosavePath = Autosave.SidecarPath(projectPath);
+        var state = new AutosaveRecovery.State(
+            File.Exists(autosavePath),
+            File.Exists(autosavePath) ? File.GetLastWriteTimeUtc(autosavePath) : default,
+            File.Exists(projectPath),
+            File.Exists(projectPath) ? File.GetLastWriteTimeUtc(projectPath) : default);
+        if (!AutosaveRecovery.ShouldOffer(state))
+            return false;
+
+        return await ConfirmDialog.Show(
+            this, "Recover unsaved changes?",
+            "A more recent autosave was found for this project — it may contain changes that weren't saved before "
+            + "the app last closed. Recover it, or open the last saved version?",
+            "Recover", "Open saved version");
+    }
+
+    /// <summary>
+    /// File ▸ Save: writes to the project's current file, or prompts (Save As) when it has never been saved.
+    /// The actual serialization lives in <see cref="ProjectSerializer"/> (PLAN.md step 9).
+    /// </summary>
+    private void Save()
+    {
+        if (_project is null)
+            return;
+        if (_currentProjectPath is null)
+        {
+            _ = SaveAsAsync();
+            return;
+        }
+        SaveTo(_currentProjectPath);
+    }
+
+    /// <summary>
+    /// File ▸ Save As: writes the current project to a newly chosen file as an independent copy — the original
+    /// file (if any) is left untouched — and re-points the document at the new file. Returns whether the
+    /// project reached disk (<c>false</c> on a cancelled picker or a failed write), which is what lets the
+    /// unsaved-changes gate treat "Save, then close" as an all-or-nothing step.
+    /// </summary>
+    private async Task<bool> SaveAsAsync()
+    {
+        if (_project is null)
+            return false;
+
+        IStorageFile? file = await StorageProvider.SaveFilePickerAsync(new FilePickerSaveOptions
+        {
+            Title = "Save Project As",
+            SuggestedFileName = DocumentName + ".sprocket.json",
+            DefaultExtension = "json",
+            FileTypeChoices = [SprocketProjectFileType],
+        });
+        if (file?.TryGetLocalPath() is not { } path)
+            return false;
+
+        _currentProjectPath = path;
+        _projectName = ProjectDisplayName(path);
+        UpdateProjectTitle();
+        return SaveTo(path);
+    }
+
+    private bool SaveTo(string path)
+    {
+        try
+        {
+            ProjectSerializer.Save(_project!, path);
+            _savedUndoCount = _history.UndoCount;
+            // A clean save makes the autosave stale: clear the dirty flag and drop the sidecar so launch won't
+            // offer to recover an older copy (PLAN.md step 20).
+            _autosave?.ClearDirty();
+            Autosave.Delete(Autosave.SidecarPath(path));
+            OnHistoryChanged(); // refresh the dirty indicator
+            SetStatus($"Saved → {path}");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            SetStatus($"Save failed: {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Builds the MCP editor-session bridge over this window's project / history / transport
+    /// (PLAN.md step 38), or <see langword="null"/> when the shell has no project. Owned by the app-scoped
+    /// <see cref="McpServerService"/>, which re-attaches on every session swap.
+    /// </summary>
+    internal Sprocket.Mcp.IEditorSession? CreateMcpSession()
+    {
+        if (_project is null)
+            return null;
+        return new McpEditorSession(_project, _history, this);
+    }
+
+    // ── MCP session support (PLAN.md step 38 follow-on): the window-owned state and flows the
+    //    McpEditorSession seam members delegate to. All called on the UI thread (the MCP marshal point). ──
+
+    /// <summary>The document's current file path (null = untitled) — for the MCP session.</summary>
+    internal string? McpProjectPath => _currentProjectPath;
+
+    /// <summary>The Program monitor — the MCP session's transport target.</summary>
+    internal IMonitor? McpProgramMonitor => _program;
+
+    /// <summary>Whether the document has unsaved edits (the title-bar dirty indicator's condition).</summary>
+    internal bool McpIsDirty => IsDirty;
+
+    /// <summary>Saves to the current path — the MCP <c>save_project</c>. False while untitled.</summary>
+    internal bool McpSave() => _currentProjectPath is { } path && SaveTo(path);
+
+    /// <summary>Saves to an explicit path and re-points the document at it — the MCP <c>save_project_as</c>
+    /// (the dialog-free core of <see cref="SaveAsAsync"/>).</summary>
+    internal bool McpSaveAs(string path)
+    {
+        if (_project is null)
+            return false;
+        _currentProjectPath = path;
+        _projectName = ProjectDisplayName(path);
+        UpdateProjectTitle();
+        return SaveTo(path);
+    }
+
+    /// <summary>
+    /// Opens a project file for the MCP <c>open_project</c> — the dialog-free core of
+    /// <see cref="OpenProjectAsync"/> (no picker, no dirty/recovery prompts; the MCP tool gates on dirty
+    /// itself). Fires <see cref="SessionRequested"/>, which swaps the window and re-attaches a fresh MCP
+    /// session. Returns an error message, or <see langword="null"/> on success.
+    /// </summary>
+    internal string? McpOpenProject(string path)
+    {
+        if (_exporting)
+            return "an export is in progress — cancel it or wait for it to finish first.";
+        try
+        {
+            Project project = ProjectSerializer.Load(path);
+            SessionRequested?.Invoke(new SessionRequest(project, $"Opened {Path.GetFileName(path)}", path));
+            return null;
+        }
+        catch (Exception ex)
+        {
+            return $"open failed: {ex.Message}";
+        }
+    }
+
+    /// <summary>Starts a fresh empty project for the MCP <c>new_project</c>/<c>close_project</c> — the
+    /// dialog-free core of <see cref="NewProject"/>. Returns an error message, or <see langword="null"/>.</summary>
+    internal string? McpNewProject()
+    {
+        if (_exporting)
+            return "an export is in progress — cancel it or wait for it to finish first.";
+        var project = new Project();
+        project.Timeline.Tracks.Add(new VideoTrack { Name = "V1" });
+        project.Timeline.Tracks.Add(new AudioTrack { Name = "A1" });
+        SessionRequested?.Invoke(new SessionRequest(project, "New project", null));
+        return null;
+    }
+
+    // The MCP export mirrors ExportAsync minus its dialogs: same quiesce/resume discipline (a second
+    // concurrent libav* pipeline crashes the in-process muxer), progress into fields the status tool polls.
+    private CancellationTokenSource? _mcpExportCts;
+    private double _mcpExportProgress;
+    private string? _mcpExportPath;
+    private bool _mcpExportCompleted;
+    private bool _mcpExportCancelled;
+    private string? _mcpExportError;
+
+    /// <summary>The MCP export's observable state (<c>get_export_status</c>).</summary>
+    internal Sprocket.Mcp.McpExportStatus McpExportStatus => new(
+        _mcpExportCts is not null, _mcpExportProgress, _mcpExportPath,
+        _mcpExportCompleted, _mcpExportCancelled, _mcpExportError);
+
+    /// <summary>Requests cancellation of the MCP export (no-op when none is running).</summary>
+    internal void McpCancelExport() => _mcpExportCts?.Cancel();
+
+    /// <summary>
+    /// Starts a background export for the MCP <c>export_video</c> in the default delivery format (MP4 / H.264 +
+    /// AAC), with the tool's rate-control choice mapped onto <see cref="ExportOptions"/>: quality mode carries an
+    /// explicit CRF (or the High-tier default when omitted); bitrate mode carries the Mbps target / optional max
+    /// converted to bits/s (0 = the exporter's resolution-scaled default / uncapped). Returns an error message,
+    /// or <see langword="null"/> when the export was started.
+    /// </summary>
+    internal string? McpStartExport(
+        string outputPath, bool videoOnly, long? rangeInTicks, long? rangeOutTicks,
+        string? rateControl = null, int? crf = null, double? bitrateMbps = null, double? maxBitrateMbps = null,
+        bool hardware = false)
+    {
+        if (!TryParseRateControl(rateControl, out ExportRateControl mode))
+            return $"unknown rate control '{rateControl}' — use quality or bitrate.";
+        var options = new ExportOptions(
+            VideoOnly: videoOnly,
+            RateControl: mode,
+            Crf: mode == ExportRateControl.Quality ? crf ?? 0 : 0,
+            VideoBitRate: mode == ExportRateControl.Bitrate && bitrateMbps is { } t ? (long)Math.Round(t * 1_000_000) : 0,
+            MaxBitRate: mode == ExportRateControl.Bitrate && maxBitrateMbps is { } m ? (long)Math.Round(m * 1_000_000) : 0,
+            Acceleration: hardware ? ExportAcceleration.Hardware : ExportAcceleration.Software);
+        return McpStartExport(outputPath, options, rangeInTicks, rangeOutTicks);
+    }
+
+    /// <summary>Parses the MCP rate-control string (case-insensitive; <see langword="null"/>/blank = the quality
+    /// default) to an <see cref="ExportRateControl"/>.</summary>
+    private static bool TryParseRateControl(string? value, out ExportRateControl mode)
+    {
+        switch ((value ?? "").Trim().ToLowerInvariant())
+        {
+            case "" or "quality": mode = ExportRateControl.Quality; return true;
+            case "bitrate": mode = ExportRateControl.Bitrate; return true;
+            default: mode = default; return false;
+        }
+    }
+
+    /// <summary>
+    /// Starts a background audio-only export for the MCP <c>export_audio</c> (PLAN.md step 44). Returns an error
+    /// message, or <see langword="null"/> when the export was started.
+    /// </summary>
+    internal string? McpStartAudioExport(string outputPath, string audioFormat, long? rangeInTicks, long? rangeOutTicks)
+    {
+        if (!TryParseAudioFormat(audioFormat, out ExportAudioFormat format))
+            return $"unknown audio format '{audioFormat}' — use wav / flac / mp3 / aac / opus.";
+        return McpStartExport(outputPath, new ExportOptions(AudioFormat: format), rangeInTicks, rangeOutTicks);
+    }
+
+    /// <summary>Parses the MCP audio-format string (case-insensitive) to an <see cref="ExportAudioFormat"/>.</summary>
+    private static bool TryParseAudioFormat(string value, out ExportAudioFormat format)
+    {
+        switch ((value ?? "").Trim().ToLowerInvariant())
+        {
+            case "wav" or "pcm" or "wavpcm": format = ExportAudioFormat.WavPcm; return true;
+            case "flac": format = ExportAudioFormat.Flac; return true;
+            case "mp3": format = ExportAudioFormat.Mp3; return true;
+            case "aac" or "m4a": format = ExportAudioFormat.Aac; return true;
+            case "opus": format = ExportAudioFormat.Opus; return true;
+            default: format = default; return false;
+        }
+    }
+
+    private string? McpStartExport(string outputPath, ExportOptions options, long? rangeInTicks, long? rangeOutTicks)
+    {
+        if (_project is null)
+            return "no project is open.";
+        if (_exporting)
+            return "an export is already running — get_export_status / cancel_export.";
+        if (_project.Timeline.Duration <= Timecode.Zero)
+            return "the timeline is empty — nothing to export.";
+
+        ExportRange? range = null;
+        if (rangeInTicks is not null || rangeOutTicks is not null)
+        {
+            long rin = Math.Max(0, rangeInTicks ?? 0);
+            long rout = rangeOutTicks ?? _project.Timeline.Duration.Ticks;
+            if (rout <= rin)
+                return "the export range is empty.";
+            range = new ExportRange(new Timecode(rin), new Timecode(rout));
+        }
+
+        _mcpExportPath = outputPath;
+        _mcpExportProgress = 0;
+        _mcpExportCompleted = false;
+        _mcpExportCancelled = false;
+        _mcpExportError = null;
+        // The token source is created (and Running becomes true) before the async runner is fired, so a
+        // status poll issued right after this call never sees a not-running/not-completed gap.
+        var cts = new CancellationTokenSource();
+        _mcpExportCts = cts;
+        _ = RunMcpExportAsync(outputPath, options, range, cts);
+        return null;
+    }
+
+    private async Task RunMcpExportAsync(string outputPath, ExportOptions options, ExportRange? range, CancellationTokenSource cts)
+    {
+        BeginExport();
+        _exportCts = cts; // an MCP export has no dialog to cancel from, so the close/quit gate is its only stop
+        SetEnabled(false);
+        bool sourceWasActive = ReferenceEquals(_active, _source);
+        _source?.Deactivate();
+        if (_engine is not null)
+            await _engine.SuspendAsync();
+
+        var progress = new Progress<double>(p => _mcpExportProgress = p);
+        SetStatus($"Exporting (MCP) → {outputPath}");
+        try
+        {
+            await Task.Run(() => VideoExporter.Export(
+                _project!, outputPath, options, sequenceId: null, range, progress, cts.Token));
+            _mcpExportProgress = 1;
+            _mcpExportCompleted = true;
+            SetStatus($"Exported → {outputPath}");
+        }
+        catch (OperationCanceledException)
+        {
+            _mcpExportCancelled = true; // VideoExporter deletes the partial file on cancel
+            SetStatus("Export cancelled");
+        }
+        catch (Exception ex)
+        {
+            _mcpExportError = ex.Message; // ditto on failure — no corrupt file is left behind
+            SetStatus($"Export failed: {ex.Message}");
+        }
+        finally
+        {
+            _mcpExportCts = null;
+            EndExport(); // clears _exportCts before the dispose below, so the gate never cancels a dead source
+            cts.Dispose();
+            _engine?.Resume();
+            if (sourceWasActive)
+                _source?.Activate();
+            SetEnabled(true);
+        }
+    }
+
+    /// <summary>Whether the document has edits that have not been written to disk — the condition behind the
+    /// status-bar indicator and every unsaved-changes prompt.</summary>
+    internal bool IsDirty => _history.UndoCount != _savedUndoCount;
+
+    /// <summary>The document's user-facing name: its file's display name once it has one, else the untitled
+    /// project name. Used wherever the document has to be named to the user — the save prompt, the Save As
+    /// suggestion, the default export file name.</summary>
+    private string DocumentName =>
+        _currentProjectPath is null ? _projectName : ProjectDisplayName(_currentProjectPath);
+
+    /// <summary>How long to let a cancelled export unwind before closing anyway. Cancellation is checked once
+    /// per frame, so an export that is going to stop stops well inside this; the cap is there so an encoder
+    /// wedged in native code cannot trap the user in an editor that refuses to quit.</summary>
+    private static readonly TimeSpan ExportAbortGrace = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// The full close/quit gate: abandon a running export, then answer for unsaved edits. Returns <c>true</c>
+    /// when both are cleared and the shell may close. Export goes first — it is the more urgent loss, and a
+    /// user who decides to keep exporting is never asked the save question at all.
+    /// </summary>
+    internal async Task<bool> ConfirmCloseAsync()
+    {
+        if (_closePromptOpen)
+            return false; // already asking (a Quit can arrive while the prompt is up); don't stack a second gate
+
+        _closePromptOpen = true;
+        try
+        {
+            return await ConfirmAbortExportAsync() && await ConfirmSaveIfDirtyAsync();
+        }
+        finally
+        {
+            _closePromptOpen = false;
+        }
+    }
+
+    /// <summary>
+    /// The running-export half of the gate. Closing mid-export would tear the process down around a live
+    /// in-process muxer and leave the half-written file on disk — the very thing
+    /// <see cref="VideoExporter"/> cleans up when an export is cancelled properly. So offer to cancel it, and
+    /// on a yes actually wait for the pipeline to unwind before letting the close proceed.
+    /// </summary>
+    private async Task<bool> ConfirmAbortExportAsync()
+    {
+        if (!_exporting)
+            return true;
+
+        if (!await ConfirmDialog.Show(
+                this, "Export in progress", DiscardGuard.RunningExportMessage,
+                "Cancel Export and Close", "Keep Exporting"))
+            return false;
+
+        // Signal every pipeline that could be live: File ▸ Export and the MCP export share _exportCts, the
+        // queue drains to a stop through its own cancellation.
+        Task? unwound = _exportFinished?.Task;
+        _exportCts?.Cancel();
+        _exportQueue?.CancelAll();
+        if (unwound is not null)
+            await Task.WhenAny(unwound, Task.Delay(ExportAbortGrace));
+        return true;
+    }
+
+    /// <summary>
+    /// The unsaved-changes half of the gate, also used on its own by File ▸ New / Open / Open Sample. Returns
+    /// <c>true</c> to proceed. A clean document proceeds without asking; otherwise the user gets the
+    /// Save · Don't Save · Cancel prompt, and choosing Save has to actually succeed — a cancelled Save As, or
+    /// a write that fails, aborts the action rather than losing the work it was meant to protect.
+    /// </summary>
+    private async Task<bool> ConfirmSaveIfDirtyAsync()
+    {
+        if (!IsDirty)
+            return true;
+        if (_unsavedPromptOpen)
+            return false; // a prompt is already up; treat the duplicate request as cancelled rather than stacking
+
+        _unsavedPromptOpen = true;
+        try
+        {
+            SaveChangesChoice choice = await SaveChangesDialog.Show(
+                this, DiscardGuard.UnsavedChangesMessage(DocumentName));
+            return choice switch
+            {
+                SaveChangesChoice.Save => await SaveBeforeDiscardAsync(),
+                SaveChangesChoice.Discard => true,
+                _ => false,
+            };
+        }
+        finally
+        {
+            _unsavedPromptOpen = false;
+        }
+    }
+
+    /// <summary>The Save half of the gate: straight to the document's own file, or through Save As when it has
+    /// never been saved. Reports whether the project actually reached disk.</summary>
+    private async Task<bool> SaveBeforeDiscardAsync() =>
+        _currentProjectPath is { } path ? SaveTo(path) : await SaveAsAsync();
+
+    /// <summary>The display name for a project file (drops the <c>.sprocket.json</c> / <c>.json</c> suffix).</summary>
+    private static string ProjectDisplayName(string path)
+    {
+        string name = Path.GetFileName(path);
+        const string sprocketExt = ".sprocket.json";
+        if (name.EndsWith(sprocketExt, StringComparison.OrdinalIgnoreCase))
+            return name[..^sprocketExt.Length];
+        return Path.GetFileNameWithoutExtension(name);
+    }
+
+    /// <summary>
+    /// Exports the loaded project to an <c>.mp4</c> the user picks via a Save dialog, on a background thread
+    /// (export is CPU-bound and must not block the UI). A modal <see cref="ExportProgressDialog"/> shows
+    /// determinate progress and offers Cancel; on completion the user can open the containing folder. Pausing
+    /// playback first is mandatory — a second concurrent libav* pipeline crashes the in-process muxer. The
+    /// actual pipeline lives in <see cref="VideoExporter"/>; this is just the composition-root trigger.
+    /// </summary>
+    private async Task ExportAsync()
+    {
+        if (_exporting || _project is null)
+            return;
+
+        // Nothing to render? Say so, rather than opening a Save dialog that would only fail at encode time.
+        if (_project.Timeline.Duration <= Timecode.Zero)
+        {
+            await MessageDialog.Show(this, "Nothing to Export",
+                "The timeline is empty — add a clip before exporting.");
+            return;
+        }
+
+        // Choose the delivery container / codecs / quality (PLAN.md step 27 matrix) before picking the file.
+        // The dialog's Range selector defaults to the timeline's in/out-marked range when marks are set (the
+        // Premiere / Resolve export-dialog convention); Entire sequence otherwise.
+        Resolution res = _project.Timeline.Resolution;
+        ExportRange? marked = MarkedExportRange();
+        if (await ExportSettingsDialog.Show(this, res.Width, res.Height, projectName: DocumentName, hasMarkedRange: marked is not null)
+                is not { } choice)
+            return; // user cancelled the settings dialog
+        ExportOptions options = choice.Options;
+        ExportRange? range = choice.UseInOutRange ? marked : null;
+
+        // Let the user choose where the file goes (mirrors File ▸ Save As) instead of silently dropping a fixed
+        // file into the app's own (often read-only) install folder, where it would go unnoticed. The extension +
+        // file-type filter follow the chosen container (or the audio-only format, PLAN.md step 44).
+        (string extension, FilePickerFileType fileType) = ExportSaveFileType(options);
+        string baseName = DocumentName;
+        IStorageFile? target = await StorageProvider.SaveFilePickerAsync(new FilePickerSaveOptions
+        {
+            Title = options.AudioFormat is null ? "Export Video" : "Export Audio",
+            SuggestedFileName = baseName + extension,
+            DefaultExtension = extension.TrimStart('.'),
+            FileTypeChoices = [fileType],
+        });
+        if (target?.TryGetLocalPath() is not { } outputPath)
+            return; // user cancelled the picker — nothing exported, nothing to clean up
+
+        BeginExport();
+        SetEnabled(false); // gate transport + tab-switching: no new in-process decode pipeline may start mid-export
+
+        // The export runs an in-process FFmpeg muxer; a second concurrent libav* pipeline crashes it with a native
+        // access violation (ProxyTranscoder documents the same hazard, which is why it shells out). So quiesce
+        // every in-process decode pipeline first — Pause() is not enough (the pump + decode-ring workers keep
+        // running). Suspend the Program engine and tear down the Source monitor's decoder if its tab is open.
+        bool sourceWasActive = ReferenceEquals(_active, _source);
+        _source?.Deactivate();
+        if (_engine is not null)
+            await _engine.SuspendAsync();
+
+        using var cts = new CancellationTokenSource();
+        _exportCts = cts; // the close/quit gate stops the export the same way the dialog's Cancel button does
+        var dialog = new ExportProgressDialog(Path.GetFileName(outputPath), cts);
+        var progress = new Progress<double>(p => dialog.SetProgress(p));
+        _ = dialog.ShowDialog(this); // modal: input-blocks the shell while exporting; dismissed in the finally
+
+        bool ok = false;
+        bool cancelled = false;
+        string? error = null;
+        try
+        {
+            await Task.Run(() => VideoExporter.Export(
+                _project, outputPath, options, sequenceId: null, range, progress, cts.Token));
+            ok = true;
+        }
+        catch (OperationCanceledException)
+        {
+            cancelled = true; // VideoExporter deletes the partial (unfinalized) file on cancel
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message; // ditto on failure — no corrupt .mp4 is left behind
+        }
+        finally
+        {
+            dialog.CompleteAndClose();
+            _engine?.Resume();      // restart the Program pump (feeds rebuild + re-present the current frame)
+            if (sourceWasActive)
+                _source?.Activate(); // reopen the Source monitor's decoder if it was showing
+            EndExport();            // after CompleteAndClose, so a waiting close/quit gate resumes with no modal left up
+            SetEnabled(true);
+        }
+
+        if (ok)
+        {
+            SetStatus($"Exported → {outputPath}");
+            if (await ConfirmDialog.Show(this, "Export Complete",
+                    $"Exported to:\n{outputPath}", "Open folder", "Close"))
+                RevealInFolder(outputPath);
+        }
+        else if (cancelled)
+        {
+            SetStatus("Export cancelled");
+        }
+        else
+        {
+            SetStatus($"Export failed: {error}");
+            await MessageDialog.Show(this, "Export Failed", $"The export could not be completed:\n{error}");
+        }
+    }
+
+    /// <summary>
+    /// The timeline in/out marks as an <see cref="ExportRange"/> for the export dialogs' Range selector, or
+    /// <see langword="null"/> when no mark is set (or the marks clamp to an empty slice). A missing mark falls back
+    /// to the sequence start/end, mirroring Render In to Out and Play In to Out.
+    /// </summary>
+    private ExportRange? MarkedExportRange()
+    {
+        if (_project is null || _timeline is null || (_timeline.MarkIn is null && _timeline.MarkOut is null))
+            return null;
+        Timecode duration = _project.ActiveSequence.Timeline.Duration;
+        ExportRange range = new ExportRange(_timeline.MarkIn ?? Timecode.Zero, _timeline.MarkOut ?? duration)
+            .ClampTo(duration);
+        return range.IsValid ? range : null;
+    }
+
+    /// <summary>The save-dialog file extension + type filter for an export: the chosen video container, or the
+    /// audio-only delivery format when <see cref="ExportOptions.AudioFormat"/> is set (PLAN.md step 44).</summary>
+    private static (string Extension, FilePickerFileType FileType) ExportSaveFileType(ExportOptions options)
+    {
+        if (options.AudioFormat is { } af)
+        {
+            AudioFormatInfo info = ExportCodecs.AudioFormat(af);
+            return (info.Extension, new FilePickerFileType(info.DisplayName)
+            {
+                Patterns = ["*" + info.Extension],
+                MimeTypes = [info.MimeType],
+            });
+        }
+
+        ExportFormat format = options.Format;
+        return (format.FileExtension, new FilePickerFileType($"{ExportCodecs.Container(format.Container).DisplayName} video")
+        {
+            Patterns = ["*" + format.FileExtension],
+            MimeTypes = [format.MimeType],
+        });
+    }
+
+    // ── Export queue (PLAN.md step 29) ────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// File ▸ Export Queue… (Ctrl+Shift+E): opens the batch-export window (PLAN.md step 29). The queue runs jobs
+    /// sequentially on the same background export path the single Export command uses; jobs can differ in output
+    /// path, delivery format/quality, and target sequence. One reusable window + queue is kept per session.
+    /// </summary>
+    private void OpenExportQueue()
+    {
+        if (_project is null)
+            return;
+
+        EnsureExportQueue();
+        if (_exportQueueWindow is null)
+        {
+            _exportQueueWindow = new ExportQueueWindow(_exportQueue!, AddToQueueAsync, RunExportQueueAsync);
+            _exportQueueWindow.Closed += (_, _) => _exportQueueWindow = null;
+            _exportQueueWindow.Show(this);
+        }
+        else
+        {
+            _exportQueueWindow.Activate();
+        }
+    }
+
+    /// <summary>Builds the session's export queue on first use. The runner renders each job through
+    /// <see cref="VideoExporter"/> over the current project — the same deterministic path the single Export uses,
+    /// honouring the job's target sequence and in-out range.</summary>
+    private void EnsureExportQueue()
+    {
+        _exportQueue ??= new Export.ExportQueue((job, progress, ct) =>
+            VideoExporter.Export(_project!, job.OutputPath, job.Options, job.SequenceId, job.Range, progress, ct));
+    }
+
+    /// <summary>The queue window's "Add…" action: pick a delivery format then an output file, and enqueue a job for
+    /// the active sequence. Repeating after switching the active sequence queues a different sequence — the job
+    /// captures the sequence id, so each runs against its own sequence.</summary>
+    private async Task AddToQueueAsync()
+    {
+        if (_project is null)
+            return;
+
+        Window owner = (Window?)_exportQueueWindow ?? this;
+        Sequence sequence = _project.ActiveSequence;
+        if (sequence.Timeline.Duration <= Timecode.Zero)
+        {
+            await MessageDialog.Show(owner, "Nothing to Queue",
+                "The active sequence is empty — add a clip before queuing an export.");
+            return;
+        }
+
+        Resolution res = sequence.Timeline.Resolution;
+        ExportRange? marked = MarkedExportRange();
+        if (await ExportSettingsDialog.Show(owner, res.Width, res.Height, hasMarkedRange: marked is not null)
+                is not { } choice)
+            return;
+        ExportOptions options = choice.Options;
+        ExportRange? range = choice.UseInOutRange ? marked : null;
+
+        (string extension, FilePickerFileType fileType) = ExportSaveFileType(options);
+        string baseName = DocumentName;
+        IStorageFile? target = await owner.StorageProvider.SaveFilePickerAsync(new FilePickerSaveOptions
+        {
+            Title = "Queue Export",
+            SuggestedFileName = $"{baseName} - {sequence.Name}{extension}",
+            DefaultExtension = extension.TrimStart('.'),
+            FileTypeChoices = [fileType],
+        });
+        if (target?.TryGetLocalPath() is not { } outputPath)
+            return;
+
+        EnsureExportQueue();
+        string formatLabel = options.AudioFormat is { } af
+            ? ExportCodecs.AudioFormat(af).DisplayName
+            : ExportCodecs.Container(options.Format.Container).DisplayName;
+        string name = $"{sequence.Name} · {formatLabel}";
+        _exportQueue!.Enqueue(outputPath, options, sequenceId: sequence.Id, range: range, name: name);
+        SetStatus($"Queued export → {Path.GetFileName(outputPath)}");
+    }
+
+    /// <summary>The queue window's "Start" action: quiesce every in-process decode pipeline (as the single export
+    /// does — a second concurrent libav* pipeline crashes the muxer), run the queue to completion on the background
+    /// export path, then resume. Guarded so a run never overlaps another export.</summary>
+    private async Task RunExportQueueAsync()
+    {
+        if (_project is null || _exportQueue is null || _exporting || !_exportQueue.HasPending)
+            return;
+
+        BeginExport(); // the queue is stopped through ExportQueue.CancelAll, so it publishes no _exportCts
+        SetEnabled(false);
+
+        bool sourceWasActive = ReferenceEquals(_active, _source);
+        _source?.Deactivate();
+        if (_engine is not null)
+            await _engine.SuspendAsync();
+
+        try
+        {
+            await _exportQueue.RunAsync();
+        }
+        finally
+        {
+            _engine?.Resume();
+            if (sourceWasActive)
+                _source?.Activate();
+            EndExport();
+            SetEnabled(true);
+        }
+
+        IReadOnlyList<ExportJob> jobs = _exportQueue.Jobs;
+        int done = jobs.Count(j => j.Status == ExportJobStatus.Succeeded);
+        int failed = jobs.Count(j => j.Status == ExportJobStatus.Failed);
+        int cancelled = jobs.Count(j => j.Status == ExportJobStatus.Cancelled);
+        string summary = $"Export queue finished — {done} exported";
+        if (failed > 0) summary += $", {failed} failed";
+        if (cancelled > 0) summary += $", {cancelled} cancelled";
+        SetStatus(summary);
+    }
+
+    private enum InterchangeKind { Edl, FinalCutXml }
+
+    /// <summary>
+    /// File ▸ Export Interchange ▸ EDL / XML Interchange (PLAN.md step 28): writes the active sequence to an
+    /// interchange format for round-tripping cuts with other NLEs. Interchange is a pure model→format mapping (no
+    /// FFmpeg / in-process muxer), so — unlike the video export — it needn't quiesce the playback pipeline. Anything
+    /// the format can't carry is reported back to the user rather than silently dropped.
+    /// </summary>
+    private async Task ExportInterchangeAsync(InterchangeKind kind)
+    {
+        if (_project is null)
+            return;
+        if (_project.Timeline.Duration.Ticks <= 0)
+        {
+            await MessageDialog.Show(this, "Nothing to Export",
+                "The timeline is empty — add a clip before exporting an interchange file.");
+            return;
+        }
+
+        (string label, string extension, FilePickerFileType fileType) = kind switch
+        {
+            InterchangeKind.Edl => ("EDL", ".edl",
+                new FilePickerFileType("CMX3600 EDL") { Patterns = ["*.edl"] }),
+            _ => ("Final Cut XML", ".xml",
+                new FilePickerFileType("Final Cut XML") { Patterns = ["*.xml", "*.fcpxml"] }),
+        };
+
+        string baseName = DocumentName;
+        IStorageFile? target = await StorageProvider.SaveFilePickerAsync(new FilePickerSaveOptions
+        {
+            Title = $"Export {label}",
+            SuggestedFileName = baseName + extension,
+            DefaultExtension = extension.TrimStart('.'),
+            FileTypeChoices = [fileType],
+        });
+        if (target?.TryGetLocalPath() is not { } path)
+            return;
+
+        try
+        {
+            InterchangeReport report = kind == InterchangeKind.Edl
+                ? EdlExporter.Save(_project, path)
+                : FinalCutXmlInterchange.Save(_project, path);
+
+            SetStatus($"Exported {label} → {path}");
+            if (report.HasWarnings)
+                await MessageDialog.Show(this, $"{label} Exported — some details were not included",
+                    $"Exported to:\n{path}\n\n{label} cannot represent everything in this sequence:\n\n"
+                    + string.Join("\n", report.Warnings.Select(w => "• " + w)));
+        }
+        catch (Exception ex)
+        {
+            SetStatus($"{label} export failed: {ex.Message}");
+            await MessageDialog.Show(this, "Export Failed", $"The {label} export could not be completed:\n{ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// File ▸ Relink Media (PLAN.md step 28): re-points the project's offline sources at files under a folder the
+    /// user picks, matching by file name (disambiguated by path tail). Offline sources are those with no local path
+    /// or a path that no longer resolves — they render as black/silence until relinked (§15). The matches are
+    /// previewed for confirmation before anything is applied, and the relinked paths (a per-user concern) are
+    /// written straight to the media-link sidecar, not the shared project file.
+    /// </summary>
+    private async Task RelinkMediaAsync()
+    {
+        if (_project is null)
+            return;
+
+        IReadOnlyList<OfflineMedia> offline = MediaRelink.FindOffline(_project);
+        if (offline.Count == 0)
+        {
+            await MessageDialog.Show(this, "No Offline Media",
+                "Every source in this project resolves to a file on disk — there is nothing to relink.");
+            return;
+        }
+
+        IReadOnlyList<IStorageFolder> folders = await StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
+        {
+            Title = $"Relink {offline.Count} offline media file{(offline.Count == 1 ? "" : "s")} — choose a folder to search",
+            AllowMultiple = false,
+        });
+        if (folders.Count == 0 || folders[0].TryGetLocalPath() is not { } root)
+            return;
+
+        RelinkPlan plan = await Task.Run(() => MediaRelink.Plan(_project, root));
+        if (plan.Matches.Count == 0)
+        {
+            await MessageDialog.Show(this, "No Matches Found",
+                $"No files under the chosen folder matched the {offline.Count} offline source"
+                + $"{(offline.Count == 1 ? "" : "s")} by name.");
+            return;
+        }
+
+        string preview = "Found matches for " + plan.Matches.Count + " of " + offline.Count + " offline source(s):\n\n"
+            + string.Join("\n", plan.Matches.Take(12).Select(m => $"• {Path.GetFileName(m.NewPath)}"))
+            + (plan.Matches.Count > 12 ? $"\n… (+{plan.Matches.Count - 12} more)" : "")
+            + (plan.Ambiguous.Count > 0 ? $"\n\n{plan.Ambiguous.Count} ambiguous (several candidates) — left offline." : "")
+            + (plan.Unmatched.Count > 0 ? $"\n{plan.Unmatched.Count} not found — left offline." : "");
+        if (!await ConfirmDialog.Show(this, "Relink Media", preview, "Relink", "Cancel"))
+            return;
+
+        int relinked = MediaRelink.Apply(_project, plan);
+
+        // Relinked paths are per-user state; persist them to the sidecar (not the shared, diffable project file).
+        if (_currentProjectPath is not null)
+        {
+            try { MediaLinks.Write(_project, _currentProjectPath); }
+            catch (Exception ex) { SetStatus($"Relinked {relinked}, but the media-link sidecar could not be saved: {ex.Message}"); }
+        }
+
+        _mediaBrowser?.Refresh();
+        SetStatus($"Relinked {relinked} media file{(relinked == 1 ? "" : "s")}"
+            + (_currentProjectPath is null ? " (save the project to keep the links)." : "."));
+    }
+
+    /// <summary>Opens the OS file manager with <paramref name="path"/> selected (Explorer/Finder), or its folder
+    /// on Linux. Best-effort: revealing the output is a convenience and must never throw into the export flow.</summary>
+    private static void RevealInFolder(string path)
+    {
+        try
+        {
+            if (OperatingSystem.IsWindows())
+                Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{path}\"") { UseShellExecute = false });
+            else if (OperatingSystem.IsMacOS())
+                Process.Start(new ProcessStartInfo("open", ["-R", path]) { UseShellExecute = false });
+            else if (Path.GetDirectoryName(path) is { } dir)
+                Process.Start(new ProcessStartInfo("xdg-open", [dir]) { UseShellExecute = false });
+        }
+        catch { /* the file manager may be missing/locked down — surfacing the file is non-essential */ }
+    }
+
+    // ── Helpers ─────────────────────────────────────────────────────────────────────────────────────
+
+    private void SetEnabled(bool enabled)
+    {
+        // ProgramTab/SourceTab are included so a tab switch can't spin up the Source monitor's decoder while an
+        // export's in-process muxer is running (a second concurrent libav* pipeline crashes the muxer).
+        foreach (string name in new[] { "PlayPauseButton", "JumpStartButton", "JumpEndButton", "StepBackButton", "StepForwardButton", "Scrubber", "AddTrackButton", "ProgramTab", "SourceTab" })
+            if (this.FindControl<Control>(name) is { } c)
+                c.IsEnabled = enabled;
+        if (_exportButton is not null)
+            _exportButton.IsEnabled = enabled;
+    }
+
+    private void SetStatus(string text)
+    {
+        if (_statusText is not null)
+            _statusText.Text = text;
+    }
+
+    /// <summary>Whether an export (single or a queue run) is in flight — swapping the session (New / Open) while a
+    /// background export reads the current project would tear its engine/media out from under it, so those actions
+    /// no-op with a hint until the export finishes or is cancelled.</summary>
+    private bool BlockedByExport()
+    {
+        if (!_exporting)
+            return false;
+        SetStatus("An export is in progress — cancel or wait for it to finish first.");
+        return true;
+    }
+
+    /// <summary>Marks an export pipeline live (File ▸ Export, the MCP export, or a queue run) and opens the
+    /// signal the close/quit gate waits on. Paired with <see cref="EndExport"/> in the caller's
+    /// <c>finally</c>, so an export that fails or is cancelled still releases the gate.</summary>
+    private void BeginExport()
+    {
+        _exporting = true;
+        _exportFinished = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
+
+    /// <summary>Marks the export pipeline finished and releases anyone waiting on it to unwind.</summary>
+    private void EndExport()
+    {
+        _exporting = false;
+        _exportCts = null;
+        _exportFinished?.TrySetResult();
+        _exportFinished = null;
+    }
+
+    private static double Fps(Rational r) => r.Den > 0 ? (double)r.Num / r.Den : 0;
+
+    private static string FormatTime(Timecode t)
+    {
+        var span = TimeSpan.FromSeconds(Math.Max(0, t.ToSeconds()));
+        return $"{(int)span.TotalMinutes}:{span.Seconds:00}.{span.Milliseconds / 10:00}";
+    }
+}

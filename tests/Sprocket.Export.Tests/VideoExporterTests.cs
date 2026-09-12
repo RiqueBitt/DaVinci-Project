@@ -1,0 +1,369 @@
+using Sprocket.Core.Model;
+using Sprocket.Core.Timing;
+using Sprocket.Media;
+using Xunit;
+
+namespace Sprocket.Export.Tests;
+
+/// <summary>
+/// Exercises the full export pipeline end-to-end (PLAN.md step 8 / slice DoD #7): render the timeline through
+/// the render graph + Skia effect shaders, encode H.264 + AAC, mux to MP4, then reopen the result with the
+/// decode path and assert its properties. These are real encode→decode round-trips (libx264 + AAC), so they
+/// need the FFmpeg + SkiaSharp natives the csproj pulls in.
+/// </summary>
+public sealed class VideoExporterTests
+{
+    [Fact]
+    public void Export_ProducesPlayableMp4_WithMatchingFormat()
+    {
+        Project project = ExportFixture.BuildProject(withAudio: true);
+
+        using var output = new TempFile();
+        VideoExporter.Export(project, output.Path);
+
+        Assert.True(File.Exists(output.Path));
+        Assert.True(new FileInfo(output.Path).Length > 0);
+
+        using MediaSource decoded = MediaSource.Open(output.Path, HardwareAccelMode.Disabled);
+        ProbedMediaInfo info = decoded.Info;
+
+        Assert.True(info.HasVideo);
+        Assert.Equal(ExportFixture.Width, info.Width);
+        Assert.Equal(ExportFixture.Height, info.Height);
+        Assert.True(info.HasAudio);
+
+        // ~30 fps and ~1 s. The container reports an *averaged* frame rate, which on a 1-second clip carries
+        // a frame's worth of imprecision (30 frames over ~0.97 s ≈ 31 fps), so the bound is deliberately wide.
+        double fps = (double)info.FrameRate.Num / info.FrameRate.Den;
+        Assert.InRange(fps, 28.0, 33.0);
+        Assert.InRange(info.Duration.ToSeconds(), 0.8, 1.3);
+    }
+
+    [Fact]
+    public void Export_RendersTheFullFrameCount()
+    {
+        Project project = ExportFixture.BuildProject(withAudio: true);
+
+        using var output = new TempFile();
+        VideoExporter.Export(project, output.Path);
+
+        int frames = CountVideoFrames(output.Path);
+        // 1 s at 30 fps ≈ 30 frames; allow a small tolerance for encoder/container edge frames.
+        Assert.InRange(frames, 28, 32);
+    }
+
+    [Fact]
+    public void Export_AppliesBrightnessEffectOnTheExportPath()
+    {
+        // The same render graph + effect shaders run for export, so a brightness-down clip must produce a
+        // visibly darker first frame than an unmodified one.
+        using var dark = new TempFile();
+        using var plain = new TempFile();
+        VideoExporter.Export(ExportFixture.BuildProject(withAudio: false, brightness: 0.3), dark.Path);
+        VideoExporter.Export(ExportFixture.BuildProject(withAudio: false, brightness: 1.0), plain.Path);
+
+        double darkMean = FirstFrameMeanRgb(dark.Path);
+        double plainMean = FirstFrameMeanRgb(plain.Path);
+
+        Assert.True(darkMean < plainMean * 0.6,
+            $"Brightness 0.3 should darken the frame: dark={darkMean:0.0}, plain={plainMean:0.0}");
+    }
+
+    [Fact]
+    public void Export_WithoutAudioTracks_WritesVideoOnlyFile()
+    {
+        Project project = ExportFixture.BuildProject(withAudio: false);
+
+        using var output = new TempFile();
+        VideoExporter.Export(project, output.Path);
+
+        using MediaSource decoded = MediaSource.Open(output.Path, HardwareAccelMode.Disabled);
+        Assert.True(decoded.Info.HasVideo);
+        Assert.False(decoded.Info.HasAudio);
+    }
+
+    [Fact]
+    public void Export_ReportsProgressToCompletion()
+    {
+        Project project = ExportFixture.BuildProject(withAudio: true);
+        var reported = new List<double>();
+
+        using var output = new TempFile();
+        VideoExporter.Export(project, output.Path, progress: new Progress<double>(reported.Add));
+
+        // Progress is delivered via Progress<T> (posts to the thread pool here, since there is no sync context),
+        // so just assert it eventually hit completion.
+        Assert.Contains(reported, p => p >= 0.99);
+    }
+
+    [Fact]
+    public void Export_GeneratorClip_RendersItsPixels()
+    {
+        // PLAN.md step 19: a generator clip has no source media — its pixels come from the generator. A white
+        // colour matte must export far brighter than a black one, proving the generator drew on the export path.
+        using var white = new TempFile();
+        using var black = new TempFile();
+        VideoExporter.Export(BuildGeneratorProject("#FFFFFFFF"), white.Path);
+        VideoExporter.Export(BuildGeneratorProject("#FF000000"), black.Path);
+
+        double whiteMean = FirstFrameMeanRgb(white.Path);
+        double blackMean = FirstFrameMeanRgb(black.Path);
+        Assert.True(whiteMean > blackMean + 120,
+            $"White matte should export brighter than black: white={whiteMean:0.0}, black={blackMean:0.0}");
+
+        // The generator timeline is a real, correctly-sized, full-length video.
+        using MediaSource decoded = MediaSource.Open(white.Path, HardwareAccelMode.Disabled);
+        Assert.True(decoded.Info.HasVideo);
+        Assert.Equal(ExportFixture.Width, decoded.Info.Width);
+        Assert.InRange(CountVideoFrames(black.Path), 28, 32);
+    }
+
+    [Fact]
+    public void Export_AdjustmentLayer_GradesTheTrackBeneath()
+    {
+        // An adjustment layer on a track above the media must regrade the composite beneath it: a brightness-0.3
+        // adjustment darkens the exported frame relative to the same media with no adjustment.
+        using var graded = new TempFile();
+        using var plain = new TempFile();
+        VideoExporter.Export(BuildAdjustmentProject(brightness: 0.3), graded.Path);
+        VideoExporter.Export(BuildAdjustmentProject(brightness: null), plain.Path);
+
+        double gradedMean = FirstFrameMeanRgb(graded.Path);
+        double plainMean = FirstFrameMeanRgb(plain.Path);
+        Assert.True(gradedMean < plainMean * 0.6,
+            $"Adjustment brightness 0.3 should darken the composite: graded={gradedMean:0.0}, plain={plainMean:0.0}");
+    }
+
+    [Fact]
+    public void Export_NestedSequence_RendersItsComposite()
+    {
+        // PLAN.md step 23: a nested-sequence clip's pixels come from rendering the child sequence. A nested
+        // sequence whose child is a white colour matte must export far brighter than one whose child is black,
+        // proving the child sequence composited on the deterministic export path.
+        using var white = new TempFile();
+        using var black = new TempFile();
+        VideoExporter.Export(BuildNestedGeneratorProject("#FFFFFFFF"), white.Path);
+        VideoExporter.Export(BuildNestedGeneratorProject("#FF000000"), black.Path);
+
+        double whiteMean = FirstFrameMeanRgb(white.Path);
+        double blackMean = FirstFrameMeanRgb(black.Path);
+        Assert.True(whiteMean > blackMean + 120,
+            $"A white nested sequence should export brighter than a black one: white={whiteMean:0.0}, black={blackMean:0.0}");
+
+        // The nested-sequence timeline is a real, correctly-sized, full-length video.
+        using MediaSource decoded = MediaSource.Open(white.Path, HardwareAccelMode.Disabled);
+        Assert.True(decoded.Info.HasVideo);
+        Assert.Equal(ExportFixture.Width, decoded.Info.Width);
+        Assert.InRange(CountVideoFrames(black.Path), 28, 32);
+    }
+
+    [Fact]
+    public void Export_Transition_BlendsTheTwoClips()
+    {
+        // PLAN.md step 25: two adjacent generator clips — black then white — with a 1 s cross dissolve centred on
+        // the cut at 1 s (window [0.5, 1.5)). At the cut (transition progress 0.5) the exported frame must be
+        // mid-grey — the blend — where a plain cut would be pure white (the incoming clip). Frames well inside
+        // each clip stay black / white.
+        using var output = new TempFile();
+        VideoExporter.Export(BuildTransitionProject(), output.Path);
+
+        double start = FrameMeanRgbAt(output.Path, 3);   // ~0.1s: inside the black clip, before the window
+        double mid = FrameMeanRgbAt(output.Path, 30);    // 1.0s: the cut, progress 0.5 → grey blend
+        double end = FrameMeanRgbAt(output.Path, 57);    // ~1.9s: inside the white clip, after the window
+
+        Assert.InRange(start, 0, 45);
+        Assert.InRange(mid, 90, 165);   // a genuine blend, not a hard cut to black or white
+        Assert.InRange(end, 210, 255);
+    }
+
+    /// <summary>A one-track project: a black generator clip and a white one with a cross dissolve on their cut.</summary>
+    private static Project BuildTransitionProject()
+    {
+        var timeline = new Timeline(new Rational(ExportFixture.Fps, 1), new Resolution(ExportFixture.Width, ExportFixture.Height), ExportFixture.SampleRate);
+        var project = new Project(timeline);
+        var track = new VideoTrack { Name = "V1" };
+        var black = new GeneratorSpec(GeneratorTypeIds.SolidColor).SetString(GeneratorParamNames.Color, "#FF000000");
+        var white = new GeneratorSpec(GeneratorTypeIds.SolidColor).SetString(GeneratorParamNames.Color, "#FFFFFFFF");
+        track.Clips.Add(Clip.CreateGenerator(black, Timecode.FromSeconds(1), Timecode.Zero));
+        track.Clips.Add(Clip.CreateGenerator(white, Timecode.FromSeconds(1), Timecode.FromSeconds(1)));
+        track.Transitions.Add(new Transition(TransitionTypeIds.CrossDissolve, Timecode.FromSeconds(1), Timecode.FromSeconds(1)));
+        timeline.Tracks.Add(track);
+        return project;
+    }
+
+    /// <summary>A project whose active sequence nests a child sequence (a solid-colour matte) as a single clip.</summary>
+    private static Project BuildNestedGeneratorProject(string colorHex)
+    {
+        var format = (fps: new Rational(ExportFixture.Fps, 1), res: new Resolution(ExportFixture.Width, ExportFixture.Height));
+
+        var childTimeline = new Timeline(format.fps, format.res, ExportFixture.SampleRate);
+        var childTrack = new VideoTrack { Name = "V1" };
+        var spec = new GeneratorSpec(GeneratorTypeIds.SolidColor).SetString(GeneratorParamNames.Color, colorHex);
+        childTrack.Clips.Add(Clip.CreateGenerator(spec, Timecode.FromSeconds(1), Timecode.Zero));
+        childTimeline.Tracks.Add(childTrack);
+        var child = new Sequence(SequenceId.New(), "Child", childTimeline);
+
+        var parentTimeline = new Timeline(format.fps, format.res, ExportFixture.SampleRate);
+        var parent = new Sequence(SequenceId.New(), "Parent", parentTimeline);
+        var project = new Project(parent);
+        project.Sequences.Add(child);
+        var parentTrack = new VideoTrack { Name = "V1" };
+        parentTrack.Clips.Add(Clip.CreateSequenceClip(child.Id, Timecode.FromSeconds(1), Timecode.Zero));
+        parentTimeline.Tracks.Add(parentTrack);
+        return project;
+    }
+
+    private static Project BuildGeneratorProject(string colorHex)
+    {
+        var timeline = new Timeline(new Rational(ExportFixture.Fps, 1), new Resolution(ExportFixture.Width, ExportFixture.Height), ExportFixture.SampleRate);
+        var project = new Project(timeline);
+        var track = new VideoTrack { Name = "V1" };
+        var spec = new GeneratorSpec(GeneratorTypeIds.SolidColor).SetString(GeneratorParamNames.Color, colorHex);
+        track.Clips.Add(Clip.CreateGenerator(spec, Timecode.FromSeconds(1), Timecode.Zero));
+        timeline.Tracks.Add(track);
+        return project;
+    }
+
+    private static Project BuildAdjustmentProject(double? brightness)
+    {
+        Project project = ExportFixture.BuildProject(withAudio: false);
+        if (brightness is { } amount)
+        {
+            var adjTrack = new VideoTrack { Name = "V2" };
+            Clip adjustment = Clip.CreateAdjustment(project.Timeline.Duration, Timecode.Zero);
+            adjustment.Effects.Add(new EffectInstance(EffectTypeIds.Brightness).Set(EffectParamNames.Amount, amount));
+            adjTrack.Clips.Add(adjustment);
+            project.Timeline.Tracks.Add(adjTrack); // on top of V1 in z-order
+        }
+        return project;
+    }
+
+    [Fact]
+    public void Export_OddTimelineResolution_ProducesEvenPlayableMp4()
+    {
+        // 4:2:0 H.264 needs even dimensions; a timeline with odd width/height (cropped / phone / screen-capture
+        // sources) must export — rounded down to even (≤ 1px crop) — not crash the encoder. 321×241 → 320×240.
+        var timeline = new Timeline(
+            new Rational(ExportFixture.Fps, 1),
+            new Resolution(ExportFixture.Width + 1, ExportFixture.Height + 1),
+            ExportFixture.SampleRate);
+        var project = new Project(timeline);
+        var track = new VideoTrack { Name = "V1" };
+        var spec = new GeneratorSpec(GeneratorTypeIds.SolidColor).SetString(GeneratorParamNames.Color, "#FF3366CC");
+        track.Clips.Add(Clip.CreateGenerator(spec, Timecode.FromSeconds(1), Timecode.Zero));
+        timeline.Tracks.Add(track);
+
+        using var output = new TempFile();
+        VideoExporter.Export(project, output.Path);
+
+        using MediaSource decoded = MediaSource.Open(output.Path, HardwareAccelMode.Disabled);
+        Assert.True(decoded.Info.HasVideo);
+        Assert.Equal(ExportFixture.Width, decoded.Info.Width);   // 321 → 320
+        Assert.Equal(ExportFixture.Height, decoded.Info.Height); // 241 → 240
+    }
+
+    [Fact]
+    public void Export_EmptyTimeline_Throws()
+    {
+        var timeline = new Timeline(new Rational(30, 1), new Resolution(320, 240), 48000);
+        var project = new Project(timeline);
+
+        using var output = new TempFile();
+        Assert.Throws<ArgumentException>(() => VideoExporter.Export(project, output.Path));
+    }
+
+    [Fact]
+    public void Export_Cancelled_LeavesNoPartialFile()
+    {
+        // A cancelled export never writes the MP4 trailer, so the on-disk file is full-size but unplayable
+        // ("moov atom not found"). The exporter must delete that partial output rather than hand it back.
+        Project project = ExportFixture.BuildProject(withAudio: true);
+
+        using var output = new TempFile();
+        using var cts = new CancellationTokenSource();
+        cts.Cancel(); // already cancelled: Create writes the header, the first frame check then bails
+
+        Assert.Throws<OperationCanceledException>(() =>
+            VideoExporter.Export(project, output.Path, cancellationToken: cts.Token));
+        Assert.False(File.Exists(output.Path), "a cancelled export must not leave a partial .mp4 behind");
+    }
+
+    private static int CountVideoFrames(string path)
+    {
+        using MediaSource source = MediaSource.Open(path, HardwareAccelMode.Disabled);
+        using var pool = new VideoFramePool(source.Info.Width, source.Info.Height);
+        int count = 0;
+        while (source.TryDecodeNextFrame(pool, out VideoFrame? frame))
+        {
+            using (frame)
+                count++;
+        }
+        return count;
+    }
+
+    /// <summary>Mean of the R/G/B channels of the first decoded frame (0–255), as a brightness proxy.</summary>
+    private static unsafe double FirstFrameMeanRgb(string path)
+    {
+        using MediaSource source = MediaSource.Open(path, HardwareAccelMode.Disabled);
+        using var pool = new VideoFramePool(source.Info.Width, source.Info.Height);
+        Assert.True(source.TryDecodeNextFrame(pool, out VideoFrame? frame));
+        using (frame)
+        {
+            var p = (byte*)frame.Pixels;
+            int rowBytes = frame.RowBytes;
+            long sum = 0;
+            for (int y = 0; y < frame.Height; y++)
+            {
+                byte* row = p + (long)y * rowBytes;
+                for (int x = 0; x < frame.Width; x++)
+                {
+                    byte* px = row + x * 4; // RGBA
+                    sum += px[0] + px[1] + px[2];
+                }
+            }
+            return (double)sum / (frame.Width * (long)frame.Height * 3);
+        }
+    }
+
+    /// <summary>Mean of the R/G/B channels of the frame at <paramref name="frameIndex"/> (decoded sequentially).</summary>
+    private static unsafe double FrameMeanRgbAt(string path, int frameIndex)
+    {
+        using MediaSource source = MediaSource.Open(path, HardwareAccelMode.Disabled);
+        using var pool = new VideoFramePool(source.Info.Width, source.Info.Height);
+        VideoFrame? frame = null;
+        for (int i = 0; i <= frameIndex; i++)
+        {
+            frame?.Dispose();
+            Assert.True(source.TryDecodeNextFrame(pool, out frame), $"could not decode frame {i}");
+        }
+        using (frame)
+        {
+            var p = (byte*)frame!.Pixels;
+            int rowBytes = frame.RowBytes;
+            long sum = 0;
+            for (int y = 0; y < frame.Height; y++)
+            {
+                byte* row = p + (long)y * rowBytes;
+                for (int x = 0; x < frame.Width; x++)
+                {
+                    byte* px = row + x * 4; // RGBA
+                    sum += px[0] + px[1] + px[2];
+                }
+            }
+            return (double)sum / (frame.Width * (long)frame.Height * 3);
+        }
+    }
+
+    /// <summary>A scratch .mp4 path that deletes itself on dispose.</summary>
+    private sealed class TempFile : IDisposable
+    {
+        public string Path { get; } =
+            System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"sprocket-export-{Guid.NewGuid():N}.mp4");
+
+        public void Dispose()
+        {
+            try { if (File.Exists(Path)) File.Delete(Path); }
+            catch { /* best-effort cleanup */ }
+        }
+    }
+}

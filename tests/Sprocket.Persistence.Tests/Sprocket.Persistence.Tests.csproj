@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Pure data round-trips — no FFmpeg, no UI, no RuntimeIdentifier needed. -->
+    <ProjectReference Include="..\..\src\Sprocket.Persistence\Sprocket.Persistence.csproj" />
+  </ItemGroup>
+
+</Project>

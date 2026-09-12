@@ -1,0 +1,262 @@
+using System.Linq;
+using Sprocket.App.Inspector;
+using Sprocket.Core.Model;
+using Sprocket.Core.Timing;
+using Xunit;
+
+namespace Sprocket.App.Tests;
+
+/// <summary>
+/// Headless tests for the Inspector's pure helpers (PLAN.md step 16): value formatting and the
+/// <see cref="AnimatableValue"/> editing/keyframe transforms. The control's slider/numeric binding rests on
+/// these plus manual verification (the App is a UI-bound WinExe), mirroring the step-12 TimelineMath split.
+/// </summary>
+public class InspectorTests
+{
+    // ── InspectorFormat ───────────────────────────────────────────────────────────────────────────────
+
+    [Theory]
+    [InlineData(1.0, null, "1")]
+    [InlineData(1.15, null, "1.15")]
+    [InlineData(0.3333, null, "0.333")]
+    [InlineData(-2.5, null, "-2.5")]
+    public void Format_Trims_To_Three_Decimals(double value, string? unit, string expected) =>
+        Assert.Equal(expected, InspectorFormat.Value(value, unit));
+
+    [Fact]
+    public void Format_Appends_Units()
+    {
+        Assert.Equal("45°", InspectorFormat.Value(45, "°"));   // degrees abut the number
+        Assert.Equal("100%", InspectorFormat.Value(1.0, "%", 100)); // so does percent
+        Assert.Equal("1.5 EV", InspectorFormat.Value(1.5, "EV")); // other units are spaced
+    }
+
+    // ── DisplayScale: 0–1 ratios shown as percentages (Opacity, Scale, audio mix amounts) ────────────────
+
+    [Theory]
+    [InlineData(1.0, "100%")]
+    [InlineData(0.5, "50%")]
+    [InlineData(0.0, "0%")]
+    [InlineData(0.3333, "33.33%")]   // scaling shifts what the three-decimal trim keeps
+    [InlineData(4.0, "400%")]        // Scale's top of range
+    public void Format_Scales_Percent_Parameters(double value, string expected) =>
+        Assert.Equal(expected, InspectorFormat.Value(value, "%", 100));
+
+    [Theory]
+    [InlineData(0.07)]   // 0.07 * 100 = 7.000000000000001 in binary floating point
+    [InlineData(0.29)]
+    [InlineData(0.58)]
+    public void Format_Does_Not_Leak_Float_Noise_From_Scaling(double value)
+    {
+        // The "0.###" trim has to absorb the error scaling introduces, or a 7% field reads "7.000000000000001%".
+        string text = InspectorFormat.Value(value, "%", 100);
+        Assert.Equal($"{(int)System.Math.Round(value * 100)}%", text);
+    }
+
+    [Theory]
+    [InlineData("50%", 0.5)]   // exactly what the box displays
+    [InlineData("50", 0.5)]    // the bare number a user is likelier to type
+    [InlineData("0", 0.0)]
+    [InlineData("100", 1.0)]
+    [InlineData("33.3 %", 0.333)]
+    [InlineData("-25%", -0.25)]
+    public void TryParseValue_Converts_Percent_Back_To_Model_Units(string text, double expected)
+    {
+        Assert.True(InspectorFormat.TryParseValue(text, "%", out double v, 100));
+        Assert.Equal(expected, v, 5);
+    }
+
+    [Theory]
+    [InlineData(1.0)]
+    [InlineData(0.5)]
+    [InlineData(0.05)]
+    [InlineData(0.335)]
+    public void Percent_Display_Round_Trips_Through_Parse(double model)
+    {
+        Assert.True(InspectorFormat.TryParseValue(InspectorFormat.Value(model, "%", 100), "%", out double back, 100));
+        Assert.Equal(model, back, 5);
+    }
+
+    [Fact]
+    public void Every_Percent_Descriptor_Round_Trips_Its_Default()
+    {
+        // Guards the catalog wiring end to end: display the default the way the Inspector does, parse it back
+        // the way a commit does, and land on the model value again.
+        foreach (EffectParameterDescriptor p in EffectCatalog.BuiltIns
+                     .SelectMany(d => d.Parameters)
+                     .Where(p => p.Unit == "%"))
+        {
+            string shown = InspectorFormat.Value(p.Default, p.Unit, p.DisplayScale);
+            Assert.True(InspectorFormat.TryParseValue(shown, p.Unit, out double back, p.DisplayScale),
+                $"{p.Name} displayed as '{shown}' but did not parse back");
+            Assert.Equal(p.Default, back, 5);
+        }
+    }
+
+    // ── InspectorFormat.TryParseValue: the numeric box's unit-aware commit parse ─────────────────────────
+
+    [Theory]
+    [InlineData("1.5", null, 1.5)]
+    [InlineData("  -2.25  ", null, -2.25)]
+    [InlineData("1.5 EV", "EV", 1.5)]       // exactly what InspectorFormat.Value displays
+    [InlineData("1.5EV", "EV", 1.5)]        // no space
+    [InlineData("1.5 ev", "EV", 1.5)]       // any case
+    [InlineData("90°", "°", 90)]            // degrees abut the number
+    [InlineData("12 st", "st", 12)]
+    [InlineData("-40.5 dB", "dB", -40.5)]
+    [InlineData("42", "ms", 42)]            // bare number for a unit-bearing param
+    [InlineData("12 semitones", "st", 12)]  // unknown suffix → leading numeric token
+    public void TryParseValue_Accepts_Displayed_And_Bare_Values(string text, string? unit, double expected)
+    {
+        Assert.True(InspectorFormat.TryParseValue(text, unit, out double v));
+        Assert.Equal(expected, v, 5);
+    }
+
+    [Theory]
+    [InlineData(null, null)]
+    [InlineData("", "EV")]
+    [InlineData("   ", null)]
+    [InlineData("abc", "EV")]
+    [InlineData("EV", "EV")] // unit only, no number
+    public void TryParseValue_Rejects_NonNumeric(string? text, string? unit) =>
+        Assert.False(InspectorFormat.TryParseValue(text, unit, out _));
+
+    // ── AnimatableEditing: Hold mode for discrete parameter kinds ────────────────────────────────────────
+
+    [Fact]
+    public void DefaultInterpolation_Is_Hold_For_Discrete_Kinds()
+    {
+        Assert.Equal(Interpolation.Hold, AnimatableEditing.DefaultInterpolation(ParameterKind.Toggle));
+        Assert.Equal(Interpolation.Hold, AnimatableEditing.DefaultInterpolation(ParameterKind.Integer));
+        Assert.Equal(Interpolation.Hold, AnimatableEditing.DefaultInterpolation(ParameterKind.Dropdown));
+        Assert.Equal(Interpolation.Linear, AnimatableEditing.DefaultInterpolation(ParameterKind.Continuous));
+    }
+
+    [Fact]
+    public void EnableKeyframing_Hold_Creates_A_Hold_Keyframe()
+    {
+        AnimatableValue result = AnimatableEditing.EnableKeyframing(
+            AnimatableValue.Constant(1.0), Timecode.FromSeconds(1), Interpolation.Hold);
+        Assert.Equal(Interpolation.Hold, Assert.Single(result.Keyframes).Interpolation);
+    }
+
+    [Fact]
+    public void UpsertKeyframe_Hold_Creates_Hold_Keyframes()
+    {
+        AnimatableValue result = AnimatableEditing.SetValueAt(
+            AnimatableEditing.EnableKeyframing(AnimatableValue.Constant(0.0), Timecode.Zero, Interpolation.Hold),
+            Timecode.FromSeconds(1), 1.0, Interpolation.Hold);
+        Assert.All(result.Keyframes, k => Assert.Equal(Interpolation.Hold, k.Interpolation));
+        // The whole point: a keyframed toggle flips hard at the key, never interpolating through 0.5.
+        Assert.Equal(0.0, result.Evaluate(Timecode.FromSeconds(0.999)), 5);
+        Assert.Equal(1.0, result.Evaluate(Timecode.FromSeconds(1)), 5);
+    }
+
+    [Fact]
+    public void UpsertKeyframe_Hold_Rewrites_A_Replaced_Keyframes_Interpolation()
+    {
+        AnimatableValue linear = AnimatableValue.Animated(
+            [new Keyframe(Timecode.FromSeconds(1), 0.0, Interpolation.Linear)]);
+        AnimatableValue result = AnimatableEditing.UpsertKeyframe(
+            linear, Timecode.FromSeconds(1), 1.0, Interpolation.Hold);
+        Keyframe k = Assert.Single(result.Keyframes);
+        Assert.Equal(Interpolation.Hold, k.Interpolation); // a toggle never keeps a stale eased key
+        Assert.Equal(1.0, k.Value);
+    }
+
+    [Fact]
+    public void UpsertKeyframe_Linear_Preserves_A_Replaced_Keyframes_Interpolation()
+    {
+        AnimatableValue eased = AnimatableValue.Animated(
+            [new Keyframe(Timecode.FromSeconds(1), 0.0, Interpolation.EaseInOut)]);
+        AnimatableValue result = AnimatableEditing.UpsertKeyframe(eased, Timecode.FromSeconds(1), 1.0);
+        Assert.Equal(Interpolation.EaseInOut, Assert.Single(result.Keyframes).Interpolation);
+    }
+
+    // ── AnimatableEditing: scalar set ───────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void SetValueAt_Constant_Replaces_The_Constant()
+    {
+        AnimatableValue result = AnimatableEditing.SetValueAt(AnimatableValue.Constant(1.0), Timecode.FromSeconds(2), 0.4);
+        Assert.False(result.IsAnimated);
+        Assert.Equal(0.4, result.Evaluate(Timecode.Zero), 5);
+    }
+
+    [Fact]
+    public void SetValueAt_Animated_Upserts_A_Keyframe_At_The_Playhead()
+    {
+        AnimatableValue animated = AnimatableValue.Animated(
+        [
+            new Keyframe(Timecode.Zero, 0.0),
+            new Keyframe(Timecode.FromSeconds(4), 1.0),
+        ]);
+
+        AnimatableValue result = AnimatableEditing.SetValueAt(animated, Timecode.FromSeconds(2), 0.25);
+        Assert.True(result.IsAnimated);
+        Assert.Equal(3, result.Keyframes.Count);
+        Assert.Equal(0.25, result.Evaluate(Timecode.FromSeconds(2)), 5);
+    }
+
+    // ── AnimatableEditing: keyframe toggle ──────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void EnableKeyframing_Turns_A_Constant_Into_A_Single_Keyframe_At_The_Playhead()
+    {
+        Timecode t = Timecode.FromSeconds(3);
+        AnimatableValue result = AnimatableEditing.EnableKeyframing(AnimatableValue.Constant(0.7), t);
+
+        Assert.True(result.IsAnimated);
+        Assert.Single(result.Keyframes);
+        Assert.Equal(t.Ticks, result.Keyframes[0].Time.Ticks);
+        Assert.Equal(0.7, result.Keyframes[0].Value, 5);
+    }
+
+    [Fact]
+    public void EnableKeyframing_Leaves_An_Already_Animated_Value_Unchanged()
+    {
+        AnimatableValue animated = AnimatableValue.Animated([new Keyframe(Timecode.Zero, 0.2)]);
+        Assert.Same(animated, AnimatableEditing.EnableKeyframing(animated, Timecode.FromSeconds(1)));
+    }
+
+    [Fact]
+    public void DisableKeyframing_Collapses_To_A_Constant_At_The_Playhead()
+    {
+        AnimatableValue animated = AnimatableValue.Animated(
+        [
+            new Keyframe(Timecode.Zero, 0.0),
+            new Keyframe(Timecode.FromSeconds(4), 1.0),
+        ]);
+
+        AnimatableValue result = AnimatableEditing.DisableKeyframing(animated, Timecode.FromSeconds(2));
+        Assert.False(result.IsAnimated);
+        Assert.Equal(0.5, result.Evaluate(Timecode.Zero), 5); // value at t=2 is the 0→1 midpoint
+    }
+
+    // ── AnimatableEditing: upsert ───────────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void UpsertKeyframe_Replaces_The_Keyframe_At_The_Same_Time_Preserving_Others()
+    {
+        Timecode mid = Timecode.FromSeconds(2);
+        AnimatableValue animated = AnimatableValue.Animated(
+        [
+            new Keyframe(Timecode.Zero, 0.0),
+            new Keyframe(mid, 0.5),
+            new Keyframe(Timecode.FromSeconds(4), 1.0),
+        ]);
+
+        AnimatableValue result = AnimatableEditing.UpsertKeyframe(animated, mid, 0.9);
+        Assert.Equal(3, result.Keyframes.Count); // replaced, not added
+        Assert.Equal(0.9, result.Keyframes.Single(k => k.Time.Ticks == mid.Ticks).Value, 5);
+    }
+
+    [Fact]
+    public void UpsertKeyframe_Adds_A_New_Keyframe_When_None_Exists_At_The_Time()
+    {
+        AnimatableValue animated = AnimatableValue.Animated([new Keyframe(Timecode.Zero, 0.0)]);
+        AnimatableValue result = AnimatableEditing.UpsertKeyframe(animated, Timecode.FromSeconds(5), 1.0);
+        Assert.Equal(2, result.Keyframes.Count);
+        Assert.Equal(1.0, result.Evaluate(Timecode.FromSeconds(5)), 5);
+    }
+}

@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <!-- Decode tests need the real FFmpeg native libs (FFmpeg 8). They resolve at runtime via
+         Sprocket.Media's FFmpegLoader from the output dir (UsesFFmpegNatives copies them from
+         ./.ffmpeg-cache, see tests/Directory.Build.targets) or %SPROCKET_FFMPEG8_DIR% (set in CI).
+         The win-x64 RID is kept for a stable Windows output layout. -->
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == '' and $([MSBuild]::IsOSPlatform('Windows'))">win-x64</RuntimeIdentifier>
+    <UsesFFmpegNatives>true</UsesFFmpegNatives>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Sprocket.Media\Sprocket.Media.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,101 @@
+name: Build DaVinci Project release
+
+# Empacota o DaVinci Project (editor de vídeo, base Sprocket) no formato
+# que o módulo do Project Club consome — um arquivo único por
+# plataforma, mesmo padrão já usado pelo ProjectMC/PhotoProject/
+# HyProject. Reaproveita scripts/release.ps1 do próprio projeto (já
+# testado, já cuida de baixar o FFmpeg certo pra cada plataforma) em
+# vez de reescrever esse processo do zero — só pedimos o pacote "zip"
+# (portátil), nunca o "velopack" (instalador com auto-update pro
+# feed do projeto original, que o Project Club não usa).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Versão a publicar (ex: 1.0.0) — usada na tag e no nome dos arquivos'
+        required: true
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '10.0.x'
+      - name: Build win-x64 (zip)
+        shell: pwsh
+        run: ./scripts/release.ps1 -Version '${{ inputs.version }}' -Rids win-x64 -Package zip
+      - name: Renomear para DaVinciProject.exe
+        shell: bash
+        run: |
+          set -e
+          ZIP=$(find dist -maxdepth 1 -iname "*win-x64.zip" | head -n1)
+          if [ -z "$ZIP" ]; then echo "Não encontrei o zip win-x64 gerado."; ls -la dist/; exit 1; fi
+          mkdir -p stage
+          unzip -q "$ZIP" -d stage
+          test -f stage/DaVinciProject.exe || { echo "stage/DaVinciProject.exe não foi gerado — dotnet publish pode não ter usado o AssemblyName esperado."; ls -la stage/; exit 1; }
+          cd stage
+          zip -qr "../davinciproject-${{ inputs.version }}-win.zip" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: davinciproject-win
+          path: davinciproject-${{ inputs.version }}-win.zip
+
+  build-linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '10.0.x'
+      - name: Instalar PowerShell
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq wget apt-transport-https software-properties-common
+          wget -q https://packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb
+          sudo dpkg -i packages-microsoft-prod.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq powershell
+      - name: Build linux-x64 (zip)
+        shell: pwsh
+        run: ./scripts/release.ps1 -Version '${{ inputs.version }}' -Rids linux-x64 -Package zip
+      - name: Renomear para DaVinciProject
+        run: |
+          set -e
+          ZIP=$(find dist -maxdepth 1 -iname "*linux-x64.zip" | head -n1)
+          if [ -z "$ZIP" ]; then echo "Não encontrei o zip linux-x64 gerado."; ls -la dist/; exit 1; fi
+          mkdir -p stage
+          unzip -q "$ZIP" -d stage
+          test -f stage/DaVinciProject || { echo "stage/DaVinciProject não foi gerado — dotnet publish pode não ter usado o AssemblyName esperado."; ls -la stage/; exit 1; }
+          chmod +x stage/DaVinciProject
+          cd stage
+          tar -czf "../davinciproject-${{ inputs.version }}-linux.tar.gz" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: davinciproject-linux
+          path: davinciproject-${{ inputs.version }}-linux.tar.gz
+
+  publish:
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist }
+      - name: Publicar release em DaVinci-Project-releases
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+        run: |
+          gh release create "v${{ inputs.version }}" \
+            dist/davinciproject-win/davinciproject-${{ inputs.version }}-win.zip \
+            dist/davinciproject-linux/davinciproject-${{ inputs.version }}-linux.tar.gz \
+            --repo RiqueBitt/DaVinci-Project-releases \
+            --title "DaVinci Project v${{ inputs.version }}" \
+            --notes "Build automática do DaVinci Project — editor de vídeo opcional do Project Club."

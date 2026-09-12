@@ -1,0 +1,106 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Sprocket.App — the Avalonia UI shell. For the vertical slice (PLAN.md step 4) it hosts the
+    Skia preview surface + a transport bar driving the PlaybackEngine (video-only, software clock).
+    It grows into the full panelled editor shell at PLAN step 11.
+  -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <!-- Item pedido: "mude o nome do .exe e no Linux para o nome do
+         projeto" — o executável final se chama exatamente isso, tanto
+         no Windows (DaVinciProject.exe) quanto no Linux
+         (DaVinciProject). O nome do projeto/assembly em si (Sprocket.App,
+         referenciado em dezenas de using/namespace no código) não
+         precisou mudar — só o nome do ARQUIVO final gerado. -->
+    <AssemblyName>DaVinciProject</AssemblyName>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- Drop the ICU dependency: the self-contained build otherwise aborts at startup on distros whose
+         base image lacks libicu (Fedora, openSUSE) — .NET needs ICU for CurrentCulture, which Velopack's
+         version parse touches before Main runs. Invariant culture also suits a deterministic editor (time
+         is exact ticks, formatting is culture-independent), so no user needs to install libicu. -->
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <BuiltInComInteropSupport>true</BuiltInComInteropSupport>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- Embedded in the Windows PE binary; this is the icon file browsers / the taskbar show.
+         Windows-only — Linux desktop-integration icons are installed per-user by packaging/linux/install.sh
+         (bundled into the linux-* release by scripts/release.ps1); the macOS .app icon is part of the
+         still-outstanding packaging work (PLAN.md step 36). -->
+    <ApplicationIcon>Assets/sprocket.ico</ApplicationIcon>
+    <!-- Dev-build convenience: the repo-root Directory.Build.targets copies the FFmpeg 8 natives from
+         ./.ffmpeg-cache (populated once by scripts/release.ps1) next to the exe, so bin/ launches and
+         `dotnet run` start without %SPROCKET_FFMPEG8_DIR%. Best-effort; release bundling is unchanged. -->
+    <UsesFFmpegNatives>true</UsesFFmpegNatives>
+  </PropertyGroup>
+
+  <!-- App icon assets, served to the UI as avares:// resources (window icon, header badge, About box). -->
+  <ItemGroup>
+    <AvaloniaResource Include="Assets/**" />
+  </ItemGroup>
+
+  <!-- Bundled demo clip + music bed + their curated project for File ▸ Open Sample Project. Loose files copied
+       next to the exe (NOT avares:// resources) so MediaSource / FFmpeg can open the media by filesystem path
+       and the project JSON resolves its project-relative "sample.mp4" / "runner.mp3" against the same Samples
+       folder. Resolved at runtime from <AppContext.BaseDirectory>/Samples/ by MediaBootstrap.SampleMediaPath()
+       / SampleProjectPath(). Regenerate sample.sprocket.json if either asset is swapped (their media info +
+       relative names are baked in). -->
+  <ItemGroup>
+    <Content Include="Samples\sample.mp4" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="Samples\runner.mp3" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="Samples\sample.sprocket.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <!-- The third-party notices doc (PLAN.md step 36a), copied next to the exe so it ships in every release
+       bundle and Help ▸ Third-Party Notices (Dialogs.cs `ThirdPartyNoticesDialog`) can read it by path at
+       runtime, the same way the sample clip above is resolved from AppContext.BaseDirectory. Single source
+       of truth lives at the repo root so it stays next to LICENSE/README for anyone browsing the source. -->
+  <ItemGroup>
+    <Content Include="..\..\THIRD-PARTY-NOTICES.md" Link="THIRD-PARTY-NOTICES.md" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Avalonia" Version="12.1.1" />
+    <PackageReference Include="Avalonia.Desktop" Version="12.1.1" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="12.1.1" />
+
+    <!-- Installer + auto-update runtime (PLAN.md step 36). Keep in lock-step with the `vpk` CLI version
+         pinned in scripts/release.ps1 ($VpkVersion) and installed by .github/workflows/release.yml —
+         mismatched pack/runtime versions are the documented Velopack failure mode. -->
+    <PackageReference Include="Velopack" Version="1.2.0" />
+
+    <!-- Pinned to Avalonia 12.1.1's transitive SkiaSharp so the lease's Skia types match
+         Sprocket.Render's (ARCHITECTURE.md §14). Skia natives ship per-RID; Windows comes via
+         the main package, Linux + macOS via the native-asset packages. -->
+    <PackageReference Include="SkiaSharp" Version="3.119.4" />
+    <PackageReference Include="SkiaSharp.NativeAssets.Linux" Version="3.119.4" />
+    <PackageReference Include="SkiaSharp.NativeAssets.macOS" Version="3.119.4" />
+
+    <!-- FFmpeg 8 natives are NOT a NuGet dependency (no FFmpeg-8 runtime NuGet exists). They are
+         bundled per-RID next to the exe by scripts/release.ps1 (avcodec-62 / avutil-60 / … §11); in
+         local dev they are copied from ./.ffmpeg-cache by the UsesFFmpegNatives opt-in above, with
+         %SPROCKET_FFMPEG8_DIR% as the fallback searched by Sprocket.Media's FFmpegLoader. -->
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- MacMenuBridge's mirroring is internal but platform-independent, so it is unit-tested off macOS. -->
+    <InternalsVisibleTo Include="Sprocket.App.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Sprocket.Core\Sprocket.Core.csproj" />
+    <ProjectReference Include="..\Sprocket.Media\Sprocket.Media.csproj" />
+    <ProjectReference Include="..\Sprocket.Render\Sprocket.Render.csproj" />
+    <ProjectReference Include="..\Sprocket.Audio\Sprocket.Audio.csproj" />
+    <ProjectReference Include="..\Sprocket.Playback\Sprocket.Playback.csproj" />
+    <ProjectReference Include="..\Sprocket.Export\Sprocket.Export.csproj" />
+    <ProjectReference Include="..\Sprocket.Persistence\Sprocket.Persistence.csproj" />
+    <ProjectReference Include="..\Sprocket.Plugins\Sprocket.Plugins.csproj" />
+    <ProjectReference Include="..\Sprocket.Mcp\Sprocket.Mcp.csproj" />
+  </ItemGroup>
+
+</Project>

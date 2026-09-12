@@ -1,0 +1,424 @@
+# Sprocket release pipeline (PLAN.md steps 35–36).
+#
+# Triggered by pushing a v* tag (scripts/gh-release.ps1 is the local tag-cutter). Each OS job builds
+# its own RIDs with scripts/release.ps1 (self-contained folder publish + FFmpeg/OpenAL natives +
+# Velopack packages + portable zips), smoke-launches every runnable artifact headlessly
+# (--version / --ffmpeg-check / --audio-check / --mcp-check), and uploads the results as workflow
+# artifacts. The final job assembles ONE GitHub release with everything attached — single-writer, so
+# parallel jobs never race on release creation, and a failed smoke anywhere blocks the whole release.
+#
+# `linux-distro-smoke` additionally runs the published Linux zips inside clean multi-distro containers
+# (plus an emulated arm64 one) as an INFORMATIONAL signal — it is not a release gate (Linux is
+# experimental for the alpha). See its job comment and scripts/linux-distro-smoke.sh.
+#
+# The vpk CLI version installed here must match the Velopack NuGet in Sprocket.App.csproj and
+# $VpkVersion in scripts/release.ps1 — bump all three together.
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  VPK_VERSION: '1.2.0'
+
+jobs:
+  # Parse the tag into base version + prerelease suffix and require Directory.Build.props to agree —
+  # the tag-cutter commits the bump before tagging, so a mismatch means a hand-made tag on the wrong
+  # commit, which must not ship binaries stamped with a different version than the tag claims.
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      base: ${{ steps.parse.outputs.base }}
+      suffix: ${{ steps.parse.outputs.suffix }}
+      prerelease: ${{ steps.parse.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Parse tag and verify Directory.Build.props
+        id: parse
+        shell: pwsh
+        run: |
+          $tag = '${{ github.ref_name }}'
+          if ($tag -notmatch '^v(?<base>\d+\.\d+\.\d+)(?:-(?<suffix>.+))?$') {
+            throw "Tag '$tag' is not v<X.Y.Z>[-suffix]."
+          }
+          $base = $Matches['base']
+          $suffix = $Matches['suffix']
+          $props = Get-Content Directory.Build.props -Raw
+          if ($props -notmatch '<VersionPrefix>\s*([^<\s]+)\s*</VersionPrefix>') {
+            throw 'No <VersionPrefix> in Directory.Build.props.'
+          }
+          if ($Matches[1] -ne $base) {
+            throw "Tag version $base != Directory.Build.props VersionPrefix $($Matches[1]). Cut tags with scripts/gh-release.ps1."
+          }
+          "base=$base" | Out-File $env:GITHUB_OUTPUT -Append
+          "suffix=$suffix" | Out-File $env:GITHUB_OUTPUT -Append
+          "prerelease=$(if ($suffix) { 'true' } else { 'false' })" | Out-File $env:GITHUB_OUTPUT -Append
+
+  windows:
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0   # release.ps1 runs changelog.ps1 for the feed's "what's new" notes
+
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '10.0.x'
+
+      # Persist the BtbN FFmpeg download cache; release.ps1's version signature re-downloads only
+      # when upstream actually changed, so a stale restore is self-healing.
+      - name: Cache FFmpeg downloads
+        uses: actions/cache@v4
+        with:
+          path: .ffmpeg-cache
+          key: ffmpeg-windows-${{ github.run_id }}
+          restore-keys: ffmpeg-windows-
+
+      - name: Install vpk
+        run: dotnet tool install -g vpk --version ${{ env.VPK_VERSION }}
+
+      - name: Build win-x64 + win-arm64 (velopack + zip)
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          ./scripts/release.ps1 -Version '${{ needs.version.outputs.base }}' `
+            -VersionSuffix '${{ needs.version.outputs.suffix }}' `
+            -Rids win-x64,win-arm64 -Package velopack,zip
+
+      # arm64 can't execute on this runner; the x64 smoke proves the shared managed build + the
+      # bundling pipeline, and the per-RID native sets come from the same verified sources.
+      # Sprocket.exe is a GUI-subsystem binary: a plain shell call detaches immediately, so the
+      # checks run via Start-Process -Wait with stdout/stderr redirected to files.
+      - name: Smoke win-x64 (portable)
+        shell: pwsh
+        env:
+          ALSOFT_DRIVERS: 'null'   # soundcard-less runner: OpenAL Soft's null driver still loads the native
+        run: |
+          $zip = Get-ChildItem dist -Filter 'Sprocket-*-win-x64.zip' | Select-Object -First 1
+          $dir = Join-Path $env:RUNNER_TEMP 'smoke-win-x64'
+          Expand-Archive $zip.FullName -DestinationPath $dir -Force
+          foreach ($check in '--version', '--ffmpeg-check', '--audio-check', '--mcp-check') {
+            $out = Join-Path $env:RUNNER_TEMP 'check-out.txt'
+            $err = Join-Path $env:RUNNER_TEMP 'check-err.txt'
+            $p = Start-Process -FilePath "$dir/Sprocket.exe" -ArgumentList $check -Wait -PassThru `
+              -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError $err
+            Write-Host "$check -> exit=$($p.ExitCode): $("$(Get-Content $out -Raw)".Trim()) $("$(Get-Content $err -Raw)".Trim())"
+            if ($p.ExitCode -ne 0) { throw "$check failed" }
+          }
+
+      # A real end-to-end install: run the Velopack Setup silently, then launch the installed app.
+      - name: Smoke win-x64 (silent install)
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem dist/velopack/win-x64 -Filter '*-Setup.exe' | Select-Object -First 1
+          Start-Process -FilePath $setup.FullName -ArgumentList '--silent' -Wait
+          $exe = "$env:LocalAppData\Sprocket\current\Sprocket.exe"
+          if (-not (Test-Path $exe)) { throw "Installed exe not found at $exe" }
+          # --silent suppresses the post-install auto-launch, but kill any straggler defensively so
+          # the headless check below is the only instance.
+          Get-Process Sprocket -ErrorAction SilentlyContinue | Stop-Process -Force
+          $out = Join-Path $env:RUNNER_TEMP 'install-check.txt'
+          $err = Join-Path $env:RUNNER_TEMP 'install-check-err.txt'
+          $p = Start-Process -FilePath $exe -ArgumentList '--ffmpeg-check' -Wait -PassThru `
+            -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError $err
+          Write-Host "installed --ffmpeg-check -> exit=$($p.ExitCode): $("$(Get-Content $out -Raw)".Trim()) $("$(Get-Content $err -Raw)".Trim())"
+          if ($p.ExitCode -ne 0) { throw 'installed --ffmpeg-check failed' }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/*.zip
+            dist/velopack/**
+          if-no-files-found: error
+
+  linux:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0   # release.ps1 runs changelog.ps1 for the feed's "what's new" notes
+
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Cache FFmpeg downloads
+        uses: actions/cache@v4
+        with:
+          path: .ffmpeg-cache
+          key: ffmpeg-linux-${{ github.run_id }}
+          restore-keys: ffmpeg-linux-
+
+      - name: Install vpk
+        run: dotnet tool install -g vpk --version ${{ env.VPK_VERSION }}
+
+      # linux-x64 gets the AppImage; linux-arm64 stays zip-only for the alpha (no arm runner to
+      # smoke an arm AppImage). -NoClean lets the second invocation add to the same dist/.
+      - name: Build linux-x64 (velopack + zip) and linux-arm64 (zip)
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          ./scripts/release.ps1 -Version '${{ needs.version.outputs.base }}' `
+            -VersionSuffix '${{ needs.version.outputs.suffix }}' `
+            -Rids linux-x64 -Package velopack,zip
+          ./scripts/release.ps1 -Version '${{ needs.version.outputs.base }}' `
+            -VersionSuffix '${{ needs.version.outputs.suffix }}' `
+            -Rids linux-arm64 -Package zip -NoClean
+
+      # Same checks scripts/linux-smoke.sh makes in Docker: bundled natives must resolve from the
+      # app dir with no LD_LIBRARY_PATH help.
+      - name: Smoke linux-x64 (portable)
+        env:
+          ALSOFT_DRIVERS: 'null'
+        run: |
+          zip=$(ls dist/Sprocket-*-linux-x64.zip)
+          dir="$RUNNER_TEMP/smoke-linux-x64"
+          mkdir -p "$dir" && unzip -q "$zip" -d "$dir"
+          chmod +x "$dir/Sprocket"
+          unset LD_LIBRARY_PATH
+          "$dir/Sprocket" --version
+          "$dir/Sprocket" --ffmpeg-check
+          "$dir/Sprocket" --audio-check
+          "$dir/Sprocket" --doctor
+          "$dir/Sprocket" --mcp-check
+
+      # --appimage-extract-and-run avoids needing FUSE on the runner.
+      - name: Smoke linux-x64 (AppImage)
+        env:
+          ALSOFT_DRIVERS: 'null'
+        run: |
+          appimage=$(ls dist/velopack/linux-x64/*.AppImage)
+          chmod +x "$appimage"
+          "$appimage" --appimage-extract-and-run --ffmpeg-check
+          "$appimage" --appimage-extract-and-run --audio-check
+          "$appimage" --appimage-extract-and-run --mcp-check
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: |
+            dist/*.zip
+            dist/velopack/**
+          if-no-files-found: error
+
+  # One job per macOS arch so brew installs native-arch FFmpeg and the smoke actually executes.
+  # vpk needs a Mac host for osx packs (codesign), which these runners are.
+  macos:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest      # Apple Silicon
+            rid: osx-arm64
+          - os: macos-15-intel    # Intel
+            rid: osx-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0   # release.ps1 runs changelog.ps1 for the feed's "what's new" notes
+
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '10.0.x'
+
+      # FFmpeg 8 from Homebrew (BtbN has no macOS builds): the versioned formula when it exists,
+      # else extract the pinned 8.1.2 formula into a temporary tap. Never fall back to core ffmpeg:
+      # scripts/macos-bundle-ffmpeg.sh hard-asserts libavcodec major 62 afterwards, so accepting
+      # FFmpeg 9 would only fail later after wasting the build.
+      - name: Install FFmpeg 8
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          brew tap homebrew/core
+          if brew install homebrew/core/ffmpeg@8; then
+            exit 0
+          fi
+
+          tap='sprocketvideo/ffmpeg-ci'
+          version='8.1.2'
+          brew tap-new --no-git "$tap"
+          brew extract --force --version="$version" ffmpeg "$tap"
+          brew install "$tap/ffmpeg@$version"
+
+      - name: Install vpk
+        run: dotnet tool install -g vpk --version ${{ env.VPK_VERSION }}
+
+      - name: Build ${{ matrix.rid }} (velopack + zip)
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          ./scripts/release.ps1 -Version '${{ needs.version.outputs.base }}' `
+            -VersionSuffix '${{ needs.version.outputs.suffix }}' `
+            -Rids ${{ matrix.rid }} -Package velopack,zip
+
+      # No brew paths in the environment: this proves the @loader_path rewrite made the bundle
+      # genuinely self-contained.
+      - name: Smoke ${{ matrix.rid }} (portable)
+        env:
+          ALSOFT_DRIVERS: 'null'
+        run: |
+          zip=$(ls dist/Sprocket-*-${{ matrix.rid }}.zip)
+          dir="$RUNNER_TEMP/smoke-${{ matrix.rid }}"
+          mkdir -p "$dir" && unzip -q "$zip" -d "$dir"
+          chmod +x "$dir/Sprocket"
+          unset DYLD_LIBRARY_PATH DYLD_FALLBACK_LIBRARY_PATH
+          "$dir/Sprocket" --version
+          "$dir/Sprocket" --ffmpeg-check
+          "$dir/Sprocket" --audio-check
+          "$dir/Sprocket" --mcp-check
+
+      # The Velopack portable zip carries the actual .app bundle — smoke its inner binary too.
+      - name: Smoke ${{ matrix.rid }} (.app)
+        env:
+          ALSOFT_DRIVERS: 'null'
+        run: |
+          zip=$(ls dist/velopack/${{ matrix.rid }}/*-Portable.zip)
+          dir="$RUNNER_TEMP/smoke-app-${{ matrix.rid }}"
+          mkdir -p "$dir" && unzip -q "$zip" -d "$dir"
+          app=$(ls -d "$dir"/*.app | head -n1)
+          unset DYLD_LIBRARY_PATH DYLD_FALLBACK_LIBRARY_PATH
+          "$app/Contents/MacOS/Sprocket" --ffmpeg-check
+          "$app/Contents/MacOS/Sprocket" --audio-check
+          "$app/Contents/MacOS/Sprocket" --mcp-check
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.rid }}
+          path: |
+            dist/*.zip
+            dist/velopack/**
+          if-no-files-found: error
+
+  # Widen Linux coverage beyond the single Ubuntu build runner: run the published zips inside clean
+  # distro containers (and an arm64 container via QEMU), installing only the DOCUMENTED runtime deps,
+  # then running the headless self-checks. Deliberately NOT in `release`'s needs — Linux is experimental
+  # for the alpha, so this is an informational signal (a red leg is a "look into this distro", not a
+  # release blocker). `fail-fast: false` so one distro's failure doesn't hide the others. Promote a leg
+  # into the release gate once it is reliably green. See scripts/linux-distro-smoke.sh.
+  linux-distro-smoke:
+    needs: [version, linux]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: 'ubuntu:22.04'      # the declared support baseline (glibc 2.35)
+            platform: linux/amd64
+          - image: 'debian:12'
+            platform: linux/amd64
+          - image: 'fedora:latest'
+            platform: linux/amd64
+          - image: 'opensuse/leap:15'
+            platform: linux/amd64
+          - image: 'archlinux:latest'
+            platform: linux/amd64
+          - image: 'ubuntu:22.04'      # arm64 runtime coverage (emulated) — closes the arm64 smoke gap
+            platform: linux/arm64
+    steps:
+      - uses: actions/checkout@v5
+
+      # binfmt/QEMU so the arm64 container's Sprocket binary can execute on the x64 runner.
+      - name: Set up QEMU
+        if: matrix.platform == 'linux/arm64'
+        uses: docker/setup-qemu-action@v3
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux
+          path: artifacts/linux
+
+      - name: Smoke ${{ matrix.image }} (${{ matrix.platform }})
+        run: |
+          docker run --rm --platform ${{ matrix.platform }} \
+            -v "$PWD:/repo" -w /repo -e HOME=/root \
+            ${{ matrix.image }} bash /repo/scripts/linux-distro-smoke.sh /repo/artifacts/linux
+
+  # Single writer: only this job touches the GitHub release, after every build + smoke passed.
+  release:
+    needs: [version, windows, linux, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0   # changelog.ps1 needs the previous v* tag
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      # Release body: a per-OS download table pinned at the very top (so users click the one file
+      # they need instead of scanning the ~25-asset list) + auto "What's changed since <prev tag>"
+      # overview + the evergreen RELEASE_NOTES.md preamble (bug reporting, running the app, known
+      # limitations). The table links this tag's installer assets by their stable, version-less
+      # names (Setup.exe / AppImage / macOS -Portable.zip); the .nupkg + releases.*.json feed files
+      # and portable zips stay under Assets for the in-app updater / advanced use.
+      - name: Assemble release notes
+        shell: pwsh
+        run: |
+          ./scripts/changelog.ps1 -Tag '${{ github.ref_name }}' -OutFile overview.md
+          $base = '${{ github.server_url }}/${{ github.repository }}/releases/download/${{ github.ref_name }}'
+          # Built as a string array (not a here-string): a PowerShell here-string's column-0 content
+          # lines would escape this YAML `run: |` block scalar.
+          $dl = @(
+            '## ⬇️ Download'
+            ''
+            'Pick the one file for your system and run it. Everything else under **Assets** (the .nupkg'
+            'and releases feed files, and the portable zips) is used by the in-app updater or for'
+            'advanced / portable use — you don''t need it.'
+            ''
+            '| Your system | Download |'
+            '|---|---|'
+            "| **Windows 10 / 11** (most PCs) | **[Sprocket Setup — x64]($base/Sprocket-win-x64-Setup.exe)** &middot; [ARM64]($base/Sprocket-win-arm64-Setup.exe) |"
+            "| **Linux** | **[Sprocket AppImage — x64]($base/Sprocket-linux-x64.AppImage)** (arm64: portable zip under Assets) |"
+            "| **macOS** — Apple Silicon (M1 and later) | **[Sprocket — arm64]($base/Sprocket-osx-arm64-Portable.zip)** |"
+            "| **macOS** — Intel | **[Sprocket — x64]($base/Sprocket-osx-x64-Portable.zip)** |"
+            ''
+            '> [!NOTE]'
+            '> These are **alpha, unsigned** builds, so each OS shows a one-time warning the first time'
+            '> you run it. See **Installing it** below for the exact click or command to get past it.'
+          )
+          $parts = @()
+          $parts += ($dl -join "`n")
+          $overview = (Get-Content overview.md -Raw -ErrorAction SilentlyContinue)
+          if ($overview) { $parts += $overview.TrimEnd() }
+          $parts += (Get-Content RELEASE_NOTES.md -Raw).TrimEnd()
+          Set-Content body.md (($parts -join "`n`n") + "`n") -Encoding utf8
+
+      # Attach: portable zips, Windows Setup.exe, Linux AppImage, macOS .app zips, and the Velopack
+      # update feed (full+delta .nupkg + releases.<channel>.json — what installed apps poll). The
+      # unsigned macOS .pkg is deliberately NOT attached (the zip'd .app + Gatekeeper instructions
+      # in RELEASE_NOTES.md are the supported alpha path). The .nupkg glob is pinned to THIS tag's
+      # version: release.ps1 runs `vpk download github` for the delta baseline, which drops the
+      # previous release's full .nupkg into the same output dir — attaching those stale packages
+      # here made every release list two versions under Assets.
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag='${{ github.ref_name }}'
+          version="${tag#v}"
+          mapfile -t assets < <(find artifacts -type f \
+            \( -name '*.zip' -o -name '*-Setup.exe' -o -name '*.AppImage' \
+               -o -name "Sprocket-${version}-*.nupkg" -o -name 'releases.*.json' \) | sort)
+          printf 'attaching %s\n' "${assets[@]}"
+          flags=(--title "$tag" --verify-tag --notes-file body.md)
+          if [ '${{ needs.version.outputs.prerelease }}' = 'true' ]; then flags+=(--prerelease); fi
+          gh release create "$tag" "${flags[@]}" "${assets[@]}"

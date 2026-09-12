@@ -1,0 +1,288 @@
+using Avalonia;
+using Avalonia.Controls;
+using Avalonia.Media;
+using Avalonia.Rendering.SceneGraph;
+using Avalonia.Skia;
+using Avalonia.Threading;
+using SkiaSharp;
+using Sprocket.Core.Model;
+using Sprocket.Core.Rendering;
+using Sprocket.Playback;
+using Sprocket.Render;
+
+namespace Sprocket.App;
+
+/// <summary>
+/// A monitor surface (PLAN.md steps 4/14/17): draws a <see cref="PlaybackEngine"/>'s currently-presented video
+/// frame onto Avalonia's shared GPU <c>GRContext</c> via a Skia lease (ARCHITECTURE.md §10). It owns no decoding
+/// or timing — it invalidates when the engine signals a new frame and, inside the render-thread lease, asks the
+/// engine for the live frame and hands its native pixels to the effect pipeline (no managed copy, §1). The same
+/// control serves both the Program (composited timeline) and Source (raw clip) monitors; the engine it presents
+/// is swapped via <see cref="Attach"/>. <see cref="Zoom"/> and <see cref="ShowGuides"/> drive the <c>Fit ▾</c>
+/// level and the safe-area / framing-grid overlay (UI.md §3.4).
+/// </summary>
+public sealed class PreviewSurface : Control
+{
+    private static readonly SKColor Background = new(0x0E, 0x0E, 0x12);
+
+    private PlaybackEngine? _engine;
+    private SkiaEffectPipeline? _pipeline;
+    private MonitorZoom _zoom = MonitorZoom.Fit;
+    private bool _showGuides;
+    private int _frameWidth;
+    private int _frameHeight;
+
+    /// <summary>The preview zoom level (the <c>Fit ▾</c> control). Redraws on change.</summary>
+    public MonitorZoom Zoom
+    {
+        get => _zoom;
+        set { if (_zoom != value) { _zoom = value; InvalidateVisual(); } }
+    }
+
+    /// <summary>Whether to draw the safe-area / rule-of-thirds overlay (UI.md §3.4). Redraws on change.</summary>
+    public bool ShowGuides
+    {
+        get => _showGuides;
+        set { if (_showGuides != value) { _showGuides = value; InvalidateVisual(); } }
+    }
+
+    /// <summary>
+    /// The shared grading-scope state (PLAN.md step 34). When set and a scope is active, each presented
+    /// frame's composite is sampled after compositing (inside the same lease) so the scopes measure exactly
+    /// what the monitor shows — grade, transitions, and adjustment layers included.
+    /// </summary>
+    public ScopeState? Scopes { get; set; }
+
+    /// <summary>
+    /// The monitor's logical frame size (the sequence resolution for the Program monitor, the source's resolution
+    /// for the Source monitor). When set (both &gt; 0) every layer composites into one zoom rect derived from it
+    /// and the overlay is drawn over that rect; otherwise each layer fits individually and no overlay is drawn.
+    /// </summary>
+    public void SetFrameSize(int width, int height)
+    {
+        if (_frameWidth == width && _frameHeight == height)
+            return;
+        _frameWidth = width;
+        _frameHeight = height;
+        InvalidateVisual();
+    }
+
+    /// <summary>Attaches the engine whose current frame this surface presents; detaches any previous one. The
+    /// effect pipeline is compiled once on first attach and reused.</summary>
+    public void Attach(PlaybackEngine engine)
+    {
+        ArgumentNullException.ThrowIfNull(engine);
+        if (ReferenceEquals(_engine, engine))
+            return;
+        if (_engine is not null)
+            _engine.FramePresented -= OnFramePresented;
+        _engine = engine;
+        // Compiles the effect SkSL once; reused on every draw to apply each layer's effect chain (§7).
+        _pipeline ??= new SkiaEffectPipeline();
+        // The engine raises FramePresented on its pump thread; marshal the invalidation to the UI thread.
+        engine.FramePresented += OnFramePresented;
+        InvalidateVisual();
+    }
+
+    /// <summary>Stops presenting the current engine (e.g. when a Source monitor's engine is torn down).</summary>
+    public void Detach()
+    {
+        if (_engine is not null)
+            _engine.FramePresented -= OnFramePresented;
+        _engine = null;
+        InvalidateVisual();
+    }
+
+    private void OnFramePresented() =>
+        Dispatcher.UIThread.Post(InvalidateVisual, DispatcherPriority.Render);
+
+    protected override void OnDetachedFromVisualTree(VisualTreeAttachmentEventArgs e)
+    {
+        if (_engine is not null)
+            _engine.FramePresented -= OnFramePresented;
+        _pipeline?.Dispose();
+        _pipeline = null;
+        base.OnDetachedFromVisualTree(e);
+    }
+
+    public override void Render(DrawingContext context) =>
+        context.Custom(new DrawOp(new Rect(Bounds.Size), _engine, _pipeline, _zoom, _showGuides, _frameWidth, _frameHeight, Scopes));
+
+    private sealed class DrawOp : ICustomDrawOperation
+    {
+        private readonly PlaybackEngine? _engine;
+        private readonly SkiaEffectPipeline? _pipeline;
+        private readonly MonitorZoom _zoom;
+        private readonly bool _showGuides;
+        private readonly int _frameWidth;
+        private readonly int _frameHeight;
+        private readonly ScopeState? _scopes;
+
+        public DrawOp(Rect bounds, PlaybackEngine? engine, SkiaEffectPipeline? pipeline,
+            MonitorZoom zoom, bool showGuides, int frameWidth, int frameHeight, ScopeState? scopes)
+        {
+            Bounds = bounds;
+            _engine = engine;
+            _pipeline = pipeline;
+            _zoom = zoom;
+            _showGuides = showGuides;
+            _frameWidth = frameWidth;
+            _frameHeight = frameHeight;
+            _scopes = scopes;
+        }
+
+        public Rect Bounds { get; }
+        public void Dispose() { }
+        public bool HitTest(Point p) => false;
+        public bool Equals(ICustomDrawOperation? other) => false;
+
+        public void Render(ImmediateDrawingContext context)
+        {
+            if (context.TryGetFeature(typeof(ISkiaSharpApiLeaseFeature)) is not ISkiaSharpApiLeaseFeature feature)
+                return;
+
+            using ISkiaSharpApiLease lease = feature.Lease();
+            SKCanvas canvas = lease.SkCanvas;
+            SKSurface? leaseSurface = lease.SkSurface; // needed to snapshot the lower composite for adjustment layers
+            var bounds = SKRect.Create((float)Bounds.Width, (float)Bounds.Height);
+
+            // Confine all drawing — crucially the canvas.Clear calls below — to this surface's own bounds. A
+            // Control does not clip to its bounds by default (ClipToBounds is false), so on entry the canvas
+            // clip is the enclosing pane's, which also covers the sibling transport bar + monitor header. This
+            // surface fills the pane and draws last (on top), so an unclipped Clear repaints the whole pane
+            // background and wipes those siblings — the real cause of the "controls blank until hover / flicker
+            // only while playing" symptom (a re-clear every presented frame). Clip to our bounds so it cannot.
+            int checkpoint = canvas.Save();
+            canvas.ClipRect(bounds);
+            try
+            {
+                if (_engine is null)
+                {
+                    canvas.Clear(Background);
+                    return;
+                }
+
+                // The engine holds the frame lock for the callback, so the native buffers stay valid while we wrap
+                // and draw them. Clear once, then composite each enabled video track's frame bottom→top — the same
+                // multi-layer compositing the export path uses (PLAN.md step 14). The draws upload to the GPU on the
+                // shared context (§10); pixels are wrapped, not copied (§1). When a logical frame size is set, all
+                // layers share one zoom rect and the overlay (UI.md §3.4) is drawn over it (PLAN.md step 17).
+                _engine.UseLayers(layers =>
+                {
+                    canvas.Clear(Background);
+
+                    bool haveFrame = _frameWidth > 0 && _frameHeight > 0;
+                    SKRect frameRect = haveFrame
+                        ? FramePresenter.ComputeZoomRect(bounds, _frameWidth, _frameHeight, _zoom)
+                        : SKRect.Empty;
+
+                    // The sequence canvas: export composites onto black (VideoExporter), so show the frame's
+                    // uncovered area as black in preview too. Besides export fidelity, this makes the frame
+                    // rectangle itself visible whenever its aspect differs from the panel's (portrait/square
+                    // sequences) — without it the empty canvas is indistinguishable from the panel background
+                    // and the guides overlay looks unclipped. Allocation-free save/clip/clear (§1 hot path).
+                    if (haveFrame)
+                    {
+                        canvas.Save();
+                        canvas.ClipRect(frameRect);
+                        canvas.Clear(SKColors.Black);
+                        canvas.Restore();
+                    }
+
+                    if (layers.Count == 0 || _pipeline is null)
+                    {
+                        // Even with nothing to composite (empty timeline / gap), the frame + guides still show.
+                        if (_showGuides && haveFrame)
+                            MonitorOverlay.Draw(canvas, frameRect, thirds: true, safeAreas: true);
+                        return;
+                    }
+
+                    // Time-driven CPU plugins (frei0r, PLAN.md step 59) get the presented playhead time.
+                    _pipeline.FrameTimeSeconds = _engine.Position.Ticks / (double)Sprocket.Core.Timing.Timecode.TicksPerSecond;
+
+                    foreach (PresentedVideoLayer l in layers)
+                    {
+                        SKRect dest = haveFrame ? frameRect : FramePresenter.ComputeFitRect(bounds, l.Width, l.Height);
+                        switch (l.Kind)
+                        {
+                            case LayerKind.Generator when l.Generator is not null:
+                                _pipeline.DrawGenerator(
+                                    canvas, dest, l.Generator, l.Width, l.Height,
+                                    l.Effects, l.Opacity, ToBlendMode(l.BlendMode));
+                                break;
+
+                            case LayerKind.Adjustment when leaseSurface is not null:
+                                // Grade the composite drawn so far beneath this layer (PLAN.md step 19).
+                                _pipeline.DrawAdjustment(
+                                    leaseSurface, dest, l.Effects, l.Opacity, ToBlendMode(l.BlendMode));
+                                break;
+
+                            case LayerKind.Media:
+                            {
+                                // Conform the frame into the sequence canvas per the clip's Fit/Fill policy —
+                                // exactly what the export path does — instead of stretching it to the canvas
+                                // rect; mismatched-aspect media letterboxes (Fit) or centre-crops (Fill) in
+                                // preview just as it will in the delivered file. Fill overflows the canvas, so
+                                // clip the draw to it (allocation-free save/restore).
+                                SKRect mediaDest = haveFrame
+                                    ? FramePresenter.ComputeConformRect(frameRect, l.Width, l.Height, l.ConformMode)
+                                    : dest;
+                                bool crop = haveFrame && l.ConformMode == ClipConformMode.Fill;
+                                if (crop) { canvas.Save(); canvas.ClipRect(frameRect); }
+                                _pipeline.DrawLayer(
+                                    canvas, mediaDest, l.Pixels, l.RowBytes, l.Width, l.Height,
+                                    l.Effects, l.Opacity, ToBlendMode(l.BlendMode), l.HasAlpha);
+                                if (crop) canvas.Restore();
+                                break;
+                            }
+
+                            case LayerKind.Sequence:
+                                // Placeholder for a nested-sequence clip: live preview compositing of the child is
+                                // deferred to the render cache (PLAN.md step 32). A muted fill shows the clip is
+                                // present; its full composite renders on export and when the child sequence is opened.
+                                DrawNestedPlaceholder(canvas, dest, l.Opacity);
+                                break;
+                        }
+                    }
+
+                    // Sample the finished composite for the grading scopes (PLAN.md step 34) before the
+                    // guides draw over it, so the scopes measure the graded picture, not the overlay.
+                    if (_scopes is not null && haveFrame && leaseSurface is not null)
+                        _scopes.Capture(leaseSurface, canvas, frameRect);
+
+                    if (_showGuides && haveFrame)
+                        MonitorOverlay.Draw(canvas, frameRect, thirds: true, safeAreas: true);
+                });
+            }
+            finally
+            {
+                canvas.RestoreToCount(checkpoint);
+            }
+        }
+
+        // Nested-sequence preview placeholder (teal, matching the timeline's nested-clip fill): a flat fill plus a
+        // brighter inset border so it reads as "content present, preview deferred" rather than a render glitch.
+        private static void DrawNestedPlaceholder(SKCanvas canvas, SKRect dest, double opacity)
+        {
+            byte a = (byte)Math.Clamp(opacity * 255.0, 0, 255);
+            using var fill = new SKPaint { Color = new SKColor(0x1F, 0x5C, 0x63, a), IsAntialias = true };
+            canvas.DrawRect(dest, fill);
+            using var border = new SKPaint
+            {
+                Color = new SKColor(0x3D, 0x8A, 0x92, a),
+                IsAntialias = true,
+                Style = SKPaintStyle.Stroke,
+                StrokeWidth = 2,
+            };
+            canvas.DrawRect(dest, border);
+        }
+
+        private static SKBlendMode ToBlendMode(BlendMode mode) => mode switch
+        {
+            BlendMode.Multiply => SKBlendMode.Multiply,
+            BlendMode.Screen => SKBlendMode.Screen,
+            BlendMode.Add => SKBlendMode.Plus,
+            _ => SKBlendMode.SrcOver,
+        };
+    }
+}

@@ -1,0 +1,12 @@
+.impeccable/hook.cache.json
+.vs/
+
+# Build output — ignore for every project (src and tests), current and future.
+**/bin/
+**/obj/
+dist/
+_imports/
+
+# Persistent FFmpeg download cache for scripts/release.ps1 (kept outside the wiped dist/).
+.ffmpeg-cache/
+.playwright-mcp/

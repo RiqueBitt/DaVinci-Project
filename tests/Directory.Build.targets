@@ -1,0 +1,10 @@
+<Project>
+
+  <!--
+    MSBuild only auto-imports the NEAREST Directory.Build.targets, so this stub chains to the repo-root
+    one, where the FFmpeg-native copy logic now lives (shared with src/Sprocket.App — see the header
+    there). Test projects keep opting in with <UsesFFmpegNatives>true</UsesFFmpegNatives> exactly as before.
+  -->
+  <Import Project="$(MSBuildThisFileDirectory)../Directory.Build.targets" />
+
+</Project>

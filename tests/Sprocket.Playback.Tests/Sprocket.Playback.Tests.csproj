@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <!-- The engine integration tests decode a real fixture, so they need the FFmpeg 8 native libs;
+         they resolve at runtime via Sprocket.Media's FFmpegLoader from the output dir
+         (UsesFFmpegNatives copies them from ./.ffmpeg-cache) or %SPROCKET_FFMPEG8_DIR% (CI). The
+         win-x64 RID is kept for a stable Windows output layout. -->
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == '' and $([MSBuild]::IsOSPlatform('Windows'))">win-x64</RuntimeIdentifier>
+    <UsesFFmpegNatives>true</UsesFFmpegNatives>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The live-pump present-integration tests render through FramePresenter on an offscreen raster surface,
+         so they need the native libSkiaSharp. SkiaSharp (via Sprocket.Render) carries the Windows/macOS natives
+         transitively but NOT Linux — same reason Sprocket.Render.Tests declares this package. Pinned to the
+         SkiaSharp version locked by ARCHITECTURE §14. -->
+    <PackageReference Include="SkiaSharp.NativeAssets.Linux.NoDependencies" Version="3.119.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Sprocket.Playback\Sprocket.Playback.csproj" />
+  </ItemGroup>
+
+</Project>

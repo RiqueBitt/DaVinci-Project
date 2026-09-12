@@ -1,0 +1,154 @@
+using System;
+using System.Threading.Tasks;
+using Velopack;
+using Velopack.Sources;
+
+namespace Sprocket.App;
+
+/// <summary>
+/// The app-scoped update service (PLAN.md steps 36 + 45), built on Velopack: for installed builds
+/// (Windows Setup, Linux AppImage, macOS .app — anything `vpk pack` produced) it checks the GitHub
+/// releases feed for this build's channel, downloads the update, and applies it with a restart. A
+/// portable-zip or dev run is not a Velopack install (<see cref="IsInstalled"/> is false) — those
+/// builds can't self-update, and the UI points at the releases page instead. Modeled on
+/// <see cref="McpServerService"/>: constructed by <see cref="App"/>, it outlives window swaps and the
+/// shell mirrors its state into a status-bar badge. All members are meant to be used from the UI
+/// thread (calls are awaited from it, so continuations land back there).
+/// </summary>
+internal sealed class UpdateService
+{
+    /// <summary>Onde as releases são publicadas — usado só pros links "Release Notes"/"Releases page" na UI
+    /// (o auto-update de verdade via Velopack está desligado, ver o comentário no construtor abaixo).</summary>
+    public const string RepoUrl = "https://github.com/RiqueBitt/DaVinci-Project";
+
+    /// <summary>The human releases page, for portable/dev builds that can't self-update.</summary>
+    public const string ReleasesPageUrl = RepoUrl + "/releases";
+
+    /// <summary>The GitHub page for a specific release — where the full notes (change overview, download
+    /// table, install steps) live. Releases are tagged <c>v&lt;version&gt;</c> by scripts/gh-release.ps1 and
+    /// Velopack reports that version without the <c>v</c>. Falls back to the releases index when the
+    /// version is unknown.</summary>
+    internal static string ReleaseUrlFor(string? version) =>
+        string.IsNullOrWhiteSpace(version) ? ReleasesPageUrl : $"{RepoUrl}/releases/tag/v{version.Trim()}";
+
+    /// <summary>What a <see cref="CheckAsync"/> call concluded, for Help ▸ Check for Updates feedback.</summary>
+    public enum Outcome
+    {
+        /// <summary>Automatic checks are switched off in Preferences (auto path only).</summary>
+        Disabled,
+
+        /// <summary>Not a Velopack install (portable zip / dev run) — self-update is unavailable.</summary>
+        NotInstalled,
+
+        /// <summary>A newer release exists for this channel (see <see cref="AvailableVersion"/>).</summary>
+        UpdateAvailable,
+
+        /// <summary>The feed held nothing newer for this channel.</summary>
+        UpToDate,
+
+        /// <summary>The check could not run (network/feed failure — see <see cref="LastError"/>).</summary>
+        Failed,
+    }
+
+    private readonly UpdateManager? _manager; // null = not a Velopack install; self-update unavailable
+    private UpdateInfo? _update;              // the pending update CheckAsync found, fed to Download/Apply
+
+    /// <summary>Version string of the newer release found ("0.1.64-alpha"), or <see langword="null"/>
+    /// when up to date, disabled, not installed, or never checked.</summary>
+    public string? AvailableVersion { get; private set; }
+
+    /// <summary>The "what's new" notes Velopack carries on the target release (Markdown), shown inline in
+    /// the update dialog — the generated per-release change overview (scripts/changelog.ps1, packed by
+    /// release.ps1). <see langword="null"/>/empty when the release was packed without notes, in which case
+    /// the dialog falls back to the "Full Release Notes" link to GitHub.</summary>
+    public string? AvailableNotes { get; private set; }
+
+    /// <summary>Where "Full Release Notes" goes: the GitHub page for the release being offered, or the
+    /// releases index when no update has been found.</summary>
+    public string ReleaseNotesUrl => ReleaseUrlFor(AvailableVersion);
+
+    /// <summary>The failure message when the last check <see cref="Outcome.Failed"/>.</summary>
+    public string? LastError { get; private set; }
+
+    /// <summary>Whether this process is a Velopack-managed install that can self-update.</summary>
+    public bool IsInstalled => _manager is not null;
+
+    /// <summary>Raised (on the UI thread) after <see cref="AvailableVersion"/> may have changed.</summary>
+    public event Action? StateChanged;
+
+    public UpdateService()
+    {
+        // Item pedido: "veja se não tem atualização do antigo projeto,
+        // faça só ser atualizado pelo próprio Project Club, não usar
+        // atualizações de fora" — esse serviço (Velopack + GithubSource)
+        // checava e baixava atualizações direto do repositório GitHub
+        // original do Sprocket, nada relacionado ao DaVinci Project/
+        // Project Club. O Project Club já tem seu próprio sistema de
+        // atualização em segundo plano pra todos os apps instalados
+        // (checkAndUpdateInstalledModules, do lado do launcher desktop)
+        // — esse aqui fica desligado por completo. _manager permanece
+        // sempre null, então IsInstalled sempre relata false e todo o
+        // resto do código (CheckAsync, a UI de "Check for Updates",
+        // etc.) já trata isso graciosamente como "self-update
+        // indisponível", sem precisar mudar mais nada.
+    }
+
+    /// <summary>
+    /// Runs one check. The automatic path (<paramref name="force"/> false) honours the Preferences
+    /// enable switch; Help ▸ Check for Updates passes <see langword="true"/> to bypass it. Network
+    /// failures leave any previously shown result in place.
+    /// </summary>
+    public async Task<Outcome> CheckAsync(UserSettings settings, bool force)
+    {
+        if (!force && !settings.UpdateCheckEnabled)
+        {
+            SetAvailable(null);
+            return Outcome.Disabled;
+        }
+
+        if (_manager is null)
+            return Outcome.NotInstalled;
+
+        UpdateInfo? update;
+        try
+        {
+            update = await _manager.CheckForUpdatesAsync();
+        }
+        catch (Exception ex)
+        {
+            LastError = "Could not reach github.com to check for updates.";
+            CrashLog.Write("Update check failed", ex);
+            return Outcome.Failed; // keep whatever was already shown; try again next launch
+        }
+
+        LastError = null;
+        _update = update;
+        SetAvailable(update?.TargetFullRelease.Version.ToString(), update?.TargetFullRelease.NotesMarkdown);
+        return update is null ? Outcome.UpToDate : Outcome.UpdateAvailable;
+    }
+
+    /// <summary>Downloads the update <see cref="CheckAsync"/> found (delta when possible, full
+    /// otherwise). <paramref name="progress"/> is reported 0–100 on a worker thread.</summary>
+    public Task DownloadAsync(Action<int> progress)
+    {
+        if (_manager is null || _update is null)
+            throw new InvalidOperationException("No pending update to download.");
+        return _manager.DownloadUpdatesAsync(_update, progress);
+    }
+
+    /// <summary>Applies the downloaded update and restarts the app. Does not return on success —
+    /// the process exits so the updater can swap the install.</summary>
+    public void ApplyAndRestart()
+    {
+        if (_manager is null || _update is null)
+            throw new InvalidOperationException("No downloaded update to apply.");
+        _manager.ApplyUpdatesAndRestart(_update);
+    }
+
+    private void SetAvailable(string? version, string? notes = null)
+    {
+        AvailableVersion = version;
+        AvailableNotes = notes;
+        StateChanged?.Invoke();
+    }
+}

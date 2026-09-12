@@ -1,0 +1,172 @@
+using System;
+using System.Linq;
+using System.Reflection;
+using Avalonia;
+using Sprocket.Media;
+
+namespace Sprocket.App;
+
+internal static class Program
+{
+    /// <summary>
+    /// Entry point for the slice's editor app: opens a media file (first CLI arg, or a generated sample
+    /// clip), builds a one-video-track project, and plays it in the Skia preview with a transport
+    /// (PLAN.md step 4). Scripting flags <c>--mcp</c> / <c>--mcp-port &lt;n&gt;</c> (parsed by
+    /// <see cref="CliOptions"/> once Avalonia hands the args to <see cref="App"/>) start the loopback MCP
+    /// server for this session, e.g. <c>Sprocket clip.mp4 --mcp</c> to script edits against an opened clip.
+    /// </summary>
+    [STAThread]
+    public static int Main(string[] args)
+    {
+        // Velopack must be the very first thing to run (its documented contract): on install/update/uninstall
+        // the OS launches the exe with hook arguments, and this call performs the hook work and exits the
+        // process before any app code touches files that are about to be swapped. A plain launch falls through.
+        Velopack.VelopackApp.Build().Run();
+
+        // Install the global crash logger next, before anything that can fault, so even an early failure
+        // (e.g. FFmpeg natives missing) is written to a discoverable log file rather than vanishing with the
+        // window. The log directory is surfaced in Help ▸ About (see CrashLog).
+        CrashLog.Install();
+
+        // Pre-load any FFmpeg natives bundled next to the executable, in dependency order, before
+        // anything touches FFmpeg (ARCHITECTURE.md §11). No-op on Windows / local dev.
+        FFmpegLoader.EnsureBundledNativesLoaded();
+
+        // Load effect plugins (PLAN.md step 33) before the UI builds its catalogs/menus. Defensive by
+        // design — a broken plugin is logged and skipped, never fatal (§15).
+        try
+        {
+            PluginService.Initialize();
+        }
+        catch (Exception ex)
+        {
+            CrashLog.Write("Plugin initialization failed", ex);
+        }
+
+        if (args.Contains("--version"))
+        {
+            Console.WriteLine($"DaVinci Project {AppVersion}");
+            return 0;
+        }
+
+        // Headless release smoke check (scripts/linux-smoke.sh): load the bundled FFmpeg natives and
+        // exit, without starting the UI. Proves the per-RID native bundling actually resolves.
+        if (args.Contains("--ffmpeg-check"))
+            return RunFFmpegCheck();
+
+        // Headless audio smoke check (PLAN.md step 35): open the bundled OpenAL Soft device and exit.
+        // CI runners have no soundcard — they set ALSOFT_DRIVERS=null so the native still loads and a
+        // (silent) device opens, proving per-RID OpenAL bundling resolves without the UI.
+        if (args.Contains("--audio-check"))
+            return RunAudioCheck();
+
+        // Headless environment self-check (PLAN.md — Linux support): report host libc/distro, load the
+        // bundled FFmpeg + OpenAL natives, and probe the system libraries the bundled build dlopen's, with
+        // per-distro install hints for any that are missing. Bounds the "experimental modern-glibc Linux"
+        // support claim with an actionable diagnosis instead of an opaque native loader crash.
+        if (args.Contains("--doctor"))
+            return Doctor.Run();
+
+        // Headless MCP smoke check (PLAN.md step 38): start the loopback MCP server and drive one real
+        // JSON-RPC exchange (initialize + tools/list), proving the packaged endpoint binds and responds
+        // without the UI. Exercised by the Linux release smoke so a shipped build's MCP is verified.
+        if (args.Contains("--mcp-check"))
+            return McpCheck.Run();
+
+        // Diagnostic: open a media file through the real MediaSource path and report what happened
+        // (or the full failure), without starting the UI.  --probe "C:\path\to\file.mp4"
+        int probeIdx = Array.IndexOf(args, "--probe");
+        if (probeIdx >= 0)
+            return RunProbe(probeIdx + 1 < args.Length ? args[probeIdx + 1] : "");
+
+        try
+        {
+            BuildAvaloniaApp().StartWithClassicDesktopLifetime(args);
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            // An exception that escaped the Avalonia message loop. AppDomain.UnhandledException usually also
+            // fires, but capture it here too so a startup/UI-thread crash is logged before the process exits.
+            CrashLog.Write("Fatal exception in main loop", ex);
+            throw;
+        }
+    }
+
+    private static int RunProbe(string path)
+    {
+        Console.WriteLine($"[probe] path: '{path}'");
+        Console.WriteLine($"[probe] File.Exists: {System.IO.File.Exists(path)}");
+        try
+        {
+            using MediaSource source = MediaSource.Open(path);
+            var i = source.Info;
+            Console.WriteLine($"[probe] OK: {i.Width}x{i.Height} {i.FrameRate} hasVideo={i.HasVideo} hasAudio={i.HasAudio} dur={i.Duration.ToSeconds():0.0}s hw={source.HardwareDeviceName ?? "software"}");
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[probe] FAIL: {ex.GetType().FullName}: {ex.Message}");
+            Console.Error.WriteLine(ex.StackTrace);
+            return 1;
+        }
+    }
+
+    private static int RunFFmpegCheck()
+    {
+        try
+        {
+            Console.WriteLine($"[ffmpeg-check] OK: {FFmpegDiagnostics.ProbeVersion()}");
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[ffmpeg-check] FAIL: {ex.GetType().Name}: {ex.Message}");
+            return 1;
+        }
+    }
+
+    private static int RunAudioCheck()
+    {
+        try
+        {
+            using var output = new Sprocket.Audio.OpenAlAudioOutput();
+            output.Configure(48000, 2);
+            Console.WriteLine("[audio-check] OK: OpenAL device opened (48 kHz stereo)");
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[audio-check] FAIL: {ex.GetType().Name}: {ex.Message}");
+            return 1;
+        }
+    }
+
+    /// <summary>The build version stamped from Directory.Build.props (informational version, falling back to file version).</summary>
+    public static string AppVersion
+    {
+        get
+        {
+            Assembly asm = Assembly.GetExecutingAssembly();
+            string? informational = asm.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+            // Strip any source-revision suffix (e.g. "0.1.1+abcdef") for a clean display string.
+            if (!string.IsNullOrEmpty(informational))
+                return informational.Split('+')[0];
+            return asm.GetName().Version?.ToString() ?? "unknown";
+        }
+    }
+
+    public static AppBuilder BuildAvaloniaApp()
+        => AppBuilder.Configure<App>()
+            .UsePlatformDetect()
+            // Stated explicitly because MacMenuBridge depends on it: the native menu bar must stay enabled, and
+            // Avalonia's default application-menu items are what supply Quit ⌘Q / Hide alongside the
+            // About / Preferences entries the bridge contributes.
+            .With(new MacOSPlatformOptions
+            {
+                ShowInDock = true,
+                DisableNativeMenus = false,
+                DisableDefaultApplicationMenuItems = false,
+            })
+            .LogToTrace();
+}

@@ -1,0 +1,245 @@
+using Sprocket.Core.Model;
+using Sprocket.Core.Timing;
+
+namespace Sprocket.Core.Rendering;
+
+/// <summary>
+/// An effect with its parameters already evaluated to concrete numbers at a specific time. The Render
+/// layer turns this into a shader; Core never sees the shader (ARCHITECTURE.md §5, §7).
+/// </summary>
+/// <param name="EffectTypeId">The effect type, e.g. <see cref="EffectTypeIds.Brightness"/>.</param>
+/// <param name="Parameters">Parameter values, evaluated at the frame's time.</param>
+public sealed record ResolvedEffect(
+    string EffectTypeId,
+    IReadOnlyDictionary<string, double> Parameters,
+    IReadOnlyDictionary<string, string>? Assets = null)
+{
+    /// <summary>Gets a parameter value, or <paramref name="fallback"/> if it is not set.</summary>
+    public double Get(string name, double fallback = 0) =>
+        Parameters.TryGetValue(name, out double value) ? value : fallback;
+
+    /// <summary>Gets an asset reference (<see cref="Model.EffectInstance.Assets"/>, PLAN.md step 49) — e.g. the
+    /// Convolution Reverb's impulse-response path — or <paramref name="fallback"/> if none is set.</summary>
+    public string GetAsset(string name, string fallback = "") =>
+        Assets is not null && Assets.TryGetValue(name, out string? value) ? value : fallback;
+}
+
+/// <summary>
+/// A generator's parameters already evaluated to concrete values at a specific time (PLAN.md step 19). The
+/// Render layer turns this into drawn pixels; Core never draws.
+/// </summary>
+/// <param name="GeneratorTypeId">The generator type, e.g. <see cref="GeneratorTypeIds.Title"/>.</param>
+/// <param name="Strings">String parameters (text, colour hex).</param>
+/// <param name="Parameters">Numeric parameters, evaluated at the frame's time.</param>
+/// <param name="Progress">The clip's normalised local progress at the frame's time — 0 at the clip's start,
+/// 1 at its end (PLAN.md step 40). Drives duration-relative content such as a rolling/crawling title; 0 for
+/// callers that resolve a bare spec with no clip context.</param>
+public sealed record ResolvedGenerator(
+    string GeneratorTypeId,
+    IReadOnlyDictionary<string, string> Strings,
+    IReadOnlyDictionary<string, double> Parameters,
+    double Progress = 0.0)
+{
+    /// <summary>Gets a numeric parameter, or <paramref name="fallback"/> if it is not set.</summary>
+    public double Get(string name, double fallback = 0) =>
+        Parameters.TryGetValue(name, out double value) ? value : fallback;
+
+    /// <summary>Gets a string parameter, or <paramref name="fallback"/> if it is not set.</summary>
+    public string GetString(string name, string fallback = "") =>
+        Strings.TryGetValue(name, out string? value) ? value : fallback;
+}
+
+/// <summary>What produces a <see cref="VideoLayer"/>'s pixels (PLAN.md step 19, step 23, step 25).</summary>
+public enum LayerKind
+{
+    /// <summary>Decoded source media fetched via <see cref="IFrameSource{TImage}"/>.</summary>
+    Media,
+
+    /// <summary>Drawn procedurally from a <see cref="VideoLayer.Generator"/>.</summary>
+    Generator,
+
+    /// <summary>An adjustment layer: its effects apply to the composite of the layers already drawn beneath it.</summary>
+    Adjustment,
+
+    /// <summary>A nested sequence (PLAN.md step 23): its pixels come from rendering <see cref="VideoLayer.NestedPlan"/>
+    /// (the child sequence's resolved plan at the mapped time) and compositing the result like any other layer.</summary>
+    Sequence,
+
+    /// <summary>A transition (PLAN.md step 25): its pixels come from blending two clips' frames — the outgoing and
+    /// incoming layers in <see cref="VideoLayer.Transition"/> — per the transition type and progress, then
+    /// compositing the blended result like any other layer.</summary>
+    Transition,
+}
+
+/// <summary>
+/// One resolved video layer: how to produce its pixels (<see cref="Kind"/>), the effect chain to apply
+/// (bottom→top), and how to composite it onto the layers beneath. For a <see cref="LayerKind.Media"/> layer
+/// <see cref="MediaRefId"/>/<see cref="SourceTime"/> name the source frame; for a <see cref="LayerKind.Generator"/>
+/// layer <see cref="Generator"/> describes the procedural content (and <see cref="SourceTime"/> is its local time);
+/// a <see cref="LayerKind.Adjustment"/> layer has no content and applies its effects to what is already composited.
+/// </summary>
+/// <param name="MediaRefId">Source to fetch from (media layers).</param>
+/// <param name="SourceTime">Time within the source / generator-local time.</param>
+/// <param name="Effects">Effect chain, evaluated at the frame's time, applied in order.</param>
+/// <param name="Opacity">Track opacity for the composite step.</param>
+/// <param name="BlendMode">Track blend mode for the composite step.</param>
+/// <param name="Kind">What produces this layer's pixels.</param>
+/// <param name="Generator">The procedural source (generator layers only).</param>
+/// <param name="NestedPlan">The child sequence's resolved frame plan (<see cref="LayerKind.Sequence"/> layers only,
+/// PLAN.md step 23): render it, then apply this layer's effect chain and composite it like any other layer.</param>
+/// <param name="Transition">The two clips to blend and how (<see cref="LayerKind.Transition"/> layers only,
+/// PLAN.md step 25): produce each side's frame, blend them per the transition, then composite the result with this
+/// layer's <see cref="Opacity"/>/<see cref="BlendMode"/> (the track's). The transition layer's own
+/// <see cref="MediaRefId"/>/<see cref="SourceTime"/>/<see cref="Effects"/> are unused.</param>
+/// <param name="ConformMode">The clip's framing policy for a content/canvas aspect mismatch
+/// (<see cref="ClipConformMode.Fit"/> letterboxes, <see cref="ClipConformMode.Fill"/> centre-crops). Resolved
+/// from <see cref="Clip.ConformMode"/>; the render layer applies it against the content's <em>actual</em>
+/// dimensions when it computes the layer's destination rectangle — the plan stays pure data with no knowledge
+/// of frame sizes (proxies and relinked media can differ from probed dimensions).</param>
+public sealed record VideoLayer(
+    MediaRefId MediaRefId,
+    Timecode SourceTime,
+    IReadOnlyList<ResolvedEffect> Effects,
+    double Opacity,
+    BlendMode BlendMode,
+    LayerKind Kind = LayerKind.Media,
+    ResolvedGenerator? Generator = null,
+    VideoFramePlan? NestedPlan = null,
+    ResolvedTransition? Transition = null,
+    ClipConformMode ConformMode = ClipConformMode.Fit,
+    bool Reverse = false);
+
+/// <summary>
+/// A transition resolved at a frame's time (PLAN.md step 25): which two clips to blend (<see cref="From"/> outgoing,
+/// <see cref="To"/> incoming — each a fully-resolved <see cref="VideoLayer"/> with its own clip effects, at unity
+/// opacity / normal blend), the blend <see cref="Progress"/> in [0, 1], and any evaluated type parameters. The
+/// Render layer turns this into a two-input shader; Core never sees the shader (§5, §7).
+/// </summary>
+/// <param name="TransitionTypeId">The transition type, e.g. <see cref="TransitionTypeIds.CrossDissolve"/>.</param>
+/// <param name="Progress">0 = full outgoing clip, 1 = full incoming clip.</param>
+/// <param name="Parameters">Type parameters, evaluated at the frame's time (empty for the v1 built-ins).</param>
+/// <param name="From">The outgoing clip's resolved layer (shown at progress 0).</param>
+/// <param name="To">The incoming clip's resolved layer (shown at progress 1).</param>
+public sealed record ResolvedTransition(
+    string TransitionTypeId,
+    double Progress,
+    IReadOnlyDictionary<string, double> Parameters,
+    VideoLayer From,
+    VideoLayer To)
+{
+    /// <summary>Gets a parameter value, or <paramref name="fallback"/> if it is not set.</summary>
+    public double Get(string name, double fallback = 0) =>
+        Parameters.TryGetValue(name, out double value) ? value : fallback;
+}
+
+/// <summary>
+/// A pure description of how to render one composited frame at a given time: the target size and the
+/// ordered layers (bottom→top, disabled tracks already removed). This is the output of the render
+/// graph's <em>resolution</em> step and the input to its execution; it is fully serializable and
+/// trivially unit-testable headlessly (ARCHITECTURE.md §5).
+/// </summary>
+/// <param name="Resolution">Target canvas size.</param>
+/// <param name="Time">The timeline time this plan was resolved for.</param>
+/// <param name="Layers">Layers to composite, bottom→top.</param>
+public sealed record VideoFramePlan(Resolution Resolution, Timecode Time, IReadOnlyList<VideoLayer> Layers);
+
+/// <summary>
+/// One resolved audio effect chain (PLAN.md step 31, ARCHITECTURE.md §19): the ordered effects with their
+/// parameters evaluated at the buffer's start time, plus the identity key the executor uses to persist the
+/// chain's DSP state (filter memory, envelopes, tails) across buffers.
+/// </summary>
+/// <param name="StateKey">An <b>identity</b> key naming which model chain this is (the clip, track, timeline,
+/// or project object). Never serialized and never dereferenced — the mixer only uses it to look up/persist the
+/// chain's stateful <see cref="Audio.IAudioEffect"/> instances between buffers, so the same chain keeps its
+/// filter state while two chains with identical effects stay independent.</param>
+/// <param name="Effects">The chain's effects in processing order, evaluated at the buffer's start.</param>
+public sealed record ResolvedAudioChain(object StateKey, IReadOnlyList<ResolvedEffect> Effects);
+
+/// <summary>
+/// One resolved audio layer for a buffer. The clip-level gain is given at both ends of the buffer so the mixer
+/// can apply a linear ramp across it (fades, ARCHITECTURE.md §6); for a constant gain the two values are equal.
+/// The mixer's per-layer order is the standard NLE/DAW signal flow (PLAN.md step 31): clip effects
+/// (<see cref="ClipChain"/>) → clip gain/fade ramp → track inserts (<see cref="TrackChain"/>, pre-fader) →
+/// track fader (<see cref="TrackGainLinear"/>) + pan → sum into the bus.
+/// </summary>
+/// <param name="MediaRefId">Source to pull PCM from.</param>
+/// <param name="SourceStart">Time within the source corresponding to the start of the buffer.</param>
+/// <param name="ClipGainStartLinear">Clip-level linear gain (clip gain × fade) at the start of the buffer.</param>
+/// <param name="ClipGainEndLinear">Clip-level linear gain at the end of the buffer.</param>
+/// <param name="TrackGainLinear">The track fader's static linear gain, applied after the track chain.</param>
+/// <param name="SpeedRatio">Playback speed (source time per timeline time, PLAN.md step 21). 1/1 = normal; the
+/// mixer resamples the source PCM by this factor. Defaults to 1/1 so non-retimed callers are unaffected.</param>
+/// <param name="NestedPlan">The child sequence's resolved audio plan (a nested-sequence layer, PLAN.md step 23):
+/// the mixer mixes it recursively, then applies this layer's gain envelope. <see langword="null"/> for an
+/// ordinary media layer.</param>
+/// <param name="PanLeft">Left-channel pan/balance gain in [0, 1] (PLAN.md step 30). 1.0 (the default) is the
+/// centred / mono case — applied by the mixer on top of the gain ramp for a stereo output.</param>
+/// <param name="PanRight">Right-channel pan/balance gain in [0, 1] (PLAN.md step 30). 1.0 = centred.</param>
+/// <param name="ClipChain">The clip's audio effect chain (PLAN.md step 31), or <see langword="null"/> when the
+/// clip has no audio effects (the common fast path).</param>
+/// <param name="TrackChain">The track's insert chain (PLAN.md step 31), or <see langword="null"/> when empty.</param>
+/// <param name="SourceEnd">Time within the source corresponding to the <em>end</em> of the buffer (PLAN.md step 21
+/// remainder), so the mixer resamples exactly the span <c>[SourceStart, SourceEnd)</c> into the buffer — the
+/// effective speed is the span over the buffer duration, which follows a speed ramp with no drift and reduces to
+/// <see cref="SpeedRatio"/> for a constant speed. <see langword="null"/> (older callers / nested plans) means
+/// "derive from <see cref="SpeedRatio"/>". For a reversed layer it precedes <see cref="SourceStart"/>.</param>
+/// <param name="Reverse">Whether the layer plays its source backwards (<see cref="Model.Clip.Reverse"/>): the
+/// mixer reads the span behind <see cref="SourceStart"/> and emits it in reverse order.</param>
+public sealed record AudioLayer(
+    MediaRefId MediaRefId,
+    Timecode SourceStart,
+    double ClipGainStartLinear,
+    double ClipGainEndLinear,
+    double TrackGainLinear,
+    Rational SpeedRatio,
+    AudioBufferPlan? NestedPlan = null,
+    double PanLeft = 1.0,
+    double PanRight = 1.0,
+    ResolvedAudioChain? ClipChain = null,
+    ResolvedAudioChain? TrackChain = null,
+    Timecode? SourceEnd = null,
+    bool Reverse = false)
+{
+    /// <summary>The combined linear gain (clip × track) at the start of the buffer — what a chain-less mix
+    /// applies in one ramp, and the value gain-focused tests/consumers read.</summary>
+    public double GainStartLinear => ClipGainStartLinear * TrackGainLinear;
+
+    /// <summary>The combined linear gain (clip × track) at the end of the buffer.</summary>
+    public double GainEndLinear => ClipGainEndLinear * TrackGainLinear;
+}
+
+/// <summary>
+/// Restricts an audio buffer plan to a measurement scope (PLAN.md step 30 loudness normalization). With the
+/// defaults the plan is the normal full mix; a non-default scope isolates one track and/or forces unity gain at
+/// a level so a scope's <em>raw</em> loudness can be measured (then normalized by setting that level's gain).
+/// Applies only at the top level of the measured sequence — nested sub-mixes always use their full gains.
+/// </summary>
+/// <param name="OnlyTrack">If set, only this audio track contributes (its own mute/solo/enabled are ignored so
+/// the track's content can be measured regardless of the current mix state).</param>
+/// <param name="UnityTrackGain">If true, track gain is forced to 0 dB (measure a track's content before its gain).</param>
+/// <param name="UnityMasterGain">If true, the project master gain is forced to 0 dB (measure before the master).</param>
+public sealed record AudioPlanScope(
+    AudioTrack? OnlyTrack = null,
+    bool UnityTrackGain = false,
+    bool UnityMasterGain = false);
+
+/// <summary>
+/// A pure description of how to fill one audio output buffer: which source spans to sum and at what
+/// gain. The mixer (Sprocket.Audio) executes it; Core only resolves it.
+/// </summary>
+/// <param name="BufferStart">Timeline time at the start of the buffer.</param>
+/// <param name="BufferDuration">Length of the buffer.</param>
+/// <param name="Layers">Audio layers to sum.</param>
+/// <param name="MasterGainLinear">Master output gain (linear) to apply after summing.</param>
+/// <param name="OutputChains">Audio effect chains to run over this plan's summed mix, in order, before
+/// <paramref name="MasterGainLinear"/> (PLAN.md step 31): the sequence's bus chain, plus — at the root —
+/// the project master chain. <see langword="null"/> when there are none (the common fast path).</param>
+public sealed record AudioBufferPlan(
+    Timecode BufferStart,
+    Timecode BufferDuration,
+    IReadOnlyList<AudioLayer> Layers,
+    double MasterGainLinear,
+    IReadOnlyList<ResolvedAudioChain>? OutputChains = null);
+/// <param name="Reverse">Whether the clip plays its source backwards (<see cref="Model.Clip.Reverse"/>, PLAN.md step 21
+/// remainder). A reversed <see cref="SourceTime"/> is an <em>exclusive</em> upper bound — the frame provider serves the
+/// latest frame strictly before it — so frame <c>k</c> of the clip mirrors exactly to source frame <c>N−1−k</c>.</param>

@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <!-- The LADSPA tests build an in-process LADSPA_Descriptor via [UnmanagedCallersOnly] function pointers,
+         exercising the real native binding + DSP plumbing without shipping a platform-specific .so (step 59). -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Sprocket.Plugins\Sprocket.Plugins.csproj" />
+    <!-- The sample plugin is built but NOT assembly-referenced: its DLL is copied to the test output and
+         loaded by PluginHost through the real collectible-ALC path, exactly like a third-party plugin.
+         (An assembly reference would pre-load its types into the default context and defeat the test.) -->
+    <ProjectReference Include="..\Sprocket.TestPlugin\Sprocket.TestPlugin.csproj"
+                      ReferenceOutputAssembly="false"
+                      OutputItemType="Content"
+                      CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>
