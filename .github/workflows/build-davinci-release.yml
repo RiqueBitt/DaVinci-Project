@@ -80,10 +80,46 @@ jobs:
           chmod +x stage/DaVinciProject
           cd stage
           tar -czf "../davinciproject-${{ inputs.version }}-linux.tar.gz" .
+          cd ..
+      - name: Empacotar AppImage
+        run: |
+          set -e
+          # Item pedido: "adicione suporte para gerar uma versão
+          # .AppImage... sem precisar instalar dependências
+          # manualmente" — o publish self-contained do .NET já embute
+          # tudo que precisa dentro de "stage" (usado no .tar.gz
+          # acima), então o AppDir é só essa mesma pasta reorganizada
+          # (usr/bin) + um .desktop, ícone e AppRun.
+          APPDIR="$GITHUB_WORKSPACE/AppDir"
+          mkdir -p "$APPDIR/usr/bin"
+          cp -r stage/* "$APPDIR/usr/bin/"
+          cp src/Sprocket.App/Assets/sprocket.png "$APPDIR/davinciproject.png"
+          cat > "$APPDIR/davinciproject.desktop" << 'DESKTOP_EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=DaVinci Project
+          Exec=DaVinciProject
+          Icon=davinciproject
+          Categories=AudioVideo;
+          DESKTOP_EOF
+          cat > "$APPDIR/AppRun" << 'APPRUN_EOF'
+          #!/bin/bash
+          DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          exec "$DIR/usr/bin/DaVinciProject" "$@"
+          APPRUN_EOF
+          chmod +x "$APPDIR/AppRun" "$APPDIR/usr/bin/DaVinciProject"
+          wget -q "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage" -O appimagetool
+          chmod +x appimagetool
+          ./appimagetool --appimage-extract-and-run "$APPDIR" "davinciproject-${{ inputs.version }}-linux.AppImage"
+          chmod +x "davinciproject-${{ inputs.version }}-linux.AppImage"
       - uses: actions/upload-artifact@v4
         with:
           name: davinciproject-linux
           path: davinciproject-${{ inputs.version }}-linux.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: davinciproject-linux-appimage
+          path: davinciproject-${{ inputs.version }}-linux.AppImage
 
   publish:
     needs: [build-windows, build-linux]
@@ -98,6 +134,7 @@ jobs:
           gh release create "v${{ inputs.version }}" \
             dist/davinciproject-win/davinciproject-${{ inputs.version }}-win.zip \
             dist/davinciproject-linux/davinciproject-${{ inputs.version }}-linux.tar.gz \
+            dist/davinciproject-linux-appimage/davinciproject-${{ inputs.version }}-linux.AppImage \
             --repo RiqueBitt/DaVinci-Project-releases \
             --title "DaVinci Project v${{ inputs.version }}" \
             --notes "Build automática do DaVinci Project — editor de vídeo opcional do Project Club."
